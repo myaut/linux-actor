@@ -1,0 +1,181 @@
+#!/usr/local/bin/stap -g
+
+%{ /* pure */
+#include <linux/list.h>
+#include "/pool/leo4-devel/actor/mod2/include/actor.h"
+%}
+
+probe begin {
+    println("ready");
+}
+
+function actor_state:string(state:long) {
+	if(state == 0)
+		return "NINI";
+	else if(state == 1)
+		return "STOP";
+	else if(state == 2)
+		return "RUN";
+	else if(state == 3)
+		return "RUN(I)";
+	else if(state == 4)
+		return "EXC";
+
+	return "?";
+}
+
+function dump_work_queue:string(list:long) %{ /* pure */
+	struct list_head* queue = (struct list_head*) THIS->list;
+	struct list_head* list_iter = NULL;
+	actor_work_t* aw;
+	char buf[MAXSTRINGLEN] = " -> ";
+	char work[32];
+	int i = 0;
+		
+	list_for_each(list_iter, queue) {
+        aw = (actor_work_t*) list_entry(list_iter, actor_work_t, aw_list);
+        
+        snprintf(work, 48, "%d: %p -> ", i, aw); 
+        strncat(buf, work, MAXSTRINGLEN);
+        ++i;
+    }
+    
+    strcpy(THIS->__retvalue, buf);
+%}
+
+function dump_actor_queues(prefix:string, ac:long) {
+	printf("%s Qmsg: %s\n", prefix, 
+			dump_work_queue(&@cast(ac, "actor_t", "kernel:actor")->a_work_message));
+	printf("%s Qact: %s\n", prefix, 
+			dump_work_queue(&@cast(ac, "actor_t", "kernel:actor")->a_work_active));
+}
+
+function dump_actor(ac:long) {
+	printf("\tACTOR: %p\n", ac);
+	printf("\tName: %s\n", kernel_string(@cast(ac, "actor_t", "kernel:actor")->a_name)); 
+	printf("\tUid: %u\n", @cast(ac, "actor_t", "kernel:actor")->a_uid);
+	printf("\tNode: %d\n", @cast(ac, "actor_t", "kernel:actor")->a_nodeid);
+	printf("\tState: %s\n", actor_state(@cast(ac, "actor_t", "kernel:actor")->a_state));
+	printf("\tCallback: %s\n", symname(@cast(ac, "actor_t", "kernel:actor")->a_exec->a_function));
+	dump_actor_queues("\t", ac);
+}
+
+function dump_actor_message(msg:long) {
+	printf("\tMESSAGE: %p\n", msg);
+	printf("\tLength: %u\n", @cast(msg, "amsg_hdr_t", "kernel:actor")->len); 
+	printf("\tUntyped ptr: %p\n", @cast(msg, "amsg_hdr_t", "kernel:actor")->untyped);
+	printf("\tTyped ptr: %p\n", @cast(msg, "amsg_hdr_t", "kernel:actor")->typed);
+}
+
+function actor_name:string(ac:long) {
+	return sprintf("%s-%d/%d", kernel_string(@cast(ac, "actor_t", "kernel:actor")->a_name),
+		@cast(ac, "actor_t", "kernel:actor")->a_uid, @cast(ac, "actor_t", "kernel:actor")->a_nodeid);
+}
+
+probe module("actor").function("actor_create").return {
+	println("CREATE ACTOR");
+	if($return) {
+		dump_actor($return);
+	}
+}
+
+probe module("actor").function("amsg_create").return {
+	println("CREATE MSG");
+	if($return) {
+		dump_actor_message($return);
+	}
+}
+
+probe module("actor").function("actor_communicate"),
+	module("actor").function("actor_communicate").return {
+	
+	ansi_set_color(34);
+	printf("COMM [%d] ac:%p %s msg: %p %s\n", pid(), $ac, actor_name($ac), $msg,
+		(is_return())? "finished" : "started");
+	ansi_reset_color();
+}
+
+probe module("actor").function("actor_work_create") { 
+	printf("CREATE WORK %s\n", actor_name($ac));
+	
+	dump_actor_message($msg);
+}
+
+probe module("actor").function("actor_work_create").return {
+	printf("\twork = %p\n", $return);
+} 
+
+probe module("actor").function("actor_try_dispatch") {
+	printf("DISPATCH @ node %d\n", $ac->a_nodeid);
+}
+
+probe module("actor").function("actor_node_process") {
+	printf("PROCESS @ node %d\n", $ah->ah_nodeid);
+}
+
+probe module("actor").function("actor_node_process").return {
+	printf("PROCESS FINISH thread @ node %d\n", $ah->ah_nodeid);
+}
+
+probe module("actor").function("actor_execute") {
+	ansi_set_color(35);
+	printf("EXECUTE %s\n", actor_name($ac));
+	ansi_reset_color();
+}
+
+probe module("actor").function("actor_queue_join") {
+	dump_actor_queues("QJOIN before", $ac);
+}
+
+probe module("actor").function("actor_queue_join").return {
+	dump_actor_queues("QJOIN after", $ac);
+}
+
+
+probe module("actor").function("actor_execute_work") {
+	printf("EXECUTE WORK %p\n", $aw);
+}
+
+probe module("actor").function("actor_set_state") {
+	printf("SET STATE %s %s->%s\n", actor_name($ac),
+				actor_state($ac->a_state), actor_state($newstate));
+}
+
+probe module("actor").function("actor_queue_isempty") {
+	dump_actor_queues("QUEUE IS_EMPTY", $ac);
+}
+
+probe module("actor").function("actor_queue_isempty").return {
+	printf("QUEUE IS_EMPTY => %d", $return);
+}
+
+/*------ ACTOR KTHREAD -------*/
+
+function print_kthread_state(state:string) {
+	ansi_set_color(32);
+	printf("KTHREAD %s @%d\n", state, cpu());
+	ansi_reset_color();
+}
+
+probe module("actor").function("actor_kthread") {
+	print_kthread_state("START");
+}
+
+probe module("actor").function("actor_kthread_exec") {
+	print_kthread_state("EXEC");
+}
+
+probe module("actor").function("actor_kthread").return {
+	print_kthread_state("FINISH");
+}
+
+/*-- TRACE --*/
+probe kernel.trace("actor_event") {
+	printf("TP %s: %s", kernel_string($name), kernel_string($str));
+}
+
+/*---- FUNC ----*/
+/* probe module("actor").function("actor_*").call, 
+	  module("actor").function("actor_*").return {	
+	printf("\t%s @%d %s\n", is_return() ? "<-" : "->" , cpu(), probefunc());
+} */
