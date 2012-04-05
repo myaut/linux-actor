@@ -1,7 +1,7 @@
 /**
  * Linux actor subsystem
  *
- * Copyright (c) Sergey Klyaus, 2011
+ * Copyright (c) Sergey Klyaus, 2011-2012
  */
 
 #ifndef ACTOR_H
@@ -14,8 +14,9 @@
 #include <linux/spinlock.h>
 #include <linux/printk.h>
 #include <linux/mutex.h>
+#include <linux/proc_fs.h>
 
-#define CONFIG_ACTOR_TRACE
+// #define CONFIG_ACTOR_TRACE
 
 /*Actor debug routine*/
 #if defined(CONFIG_ACTOR_TRACE)
@@ -29,6 +30,9 @@
 
 #define ANAMEMAXLEN     16
 #define AMAXPIPELINE    8
+
+#define APROC_HEAD_NAMELEN	 	18
+#define APROC_ACTOR_NAMELEN			21 + ANAMEMAXLEN + 1
 
 /*
  * Actor message format.
@@ -115,7 +119,6 @@ struct actor_work {
     struct list_head aw_list;
     struct completion aw_wait;
 
-
     int aw_blocking;
 };
 typedef struct actor_work actor_work_t;
@@ -162,6 +165,9 @@ struct actor {
 
 	void* 			    a_private;		/*Private section that holds actor data*/
 	unsigned long		a_private_len;
+
+	struct proc_dir_entry* a_proc_dir;
+	char a_proc_name[APROC_ACTOR_NAMELEN];
 };
 
 enum actor_head_flag {
@@ -186,7 +192,12 @@ struct actor_head {
 	 	 	 	 	 	 	 	 	 private data*/
 
 	unsigned long ah_flags;
+
 	struct task_struct* ah_kthread;
+	struct completion ah_wait;		/*Thread completion*/
+
+	struct proc_dir_entry* ah_proc_entry;
+	char ah_proc_name[APROC_HEAD_NAMELEN];
 };
 
 actor_t* actor_create(u32 flags, u32 prio, int nodeid, char* name,
@@ -194,7 +205,9 @@ actor_t* actor_create(u32 flags, u32 prio, int nodeid, char* name,
 void actor_destroy(actor_t* ac);
 actor_t* actor_byid(u64 id);
 int actor_communicate(actor_t* ac, amsg_hdr_t* msg, int blocked);
+
 amsg_hdr_t* amsg_create(u32 untyped_num, u32 typed_num, int nodeid);
+void amsg_free(amsg_hdr_t* msg);
 
 void* actor_private_allocate(actor_t* ac, unsigned long len);
 void actor_private_free(actor_t* ac);
