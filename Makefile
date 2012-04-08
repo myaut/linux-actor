@@ -1,8 +1,11 @@
 EXTRA_CFLAGS=-I/pool/leo4-devel/actor/mod2/include
 LINUX=/root/linux-3.3/ 
 
-filelist = *.c include/* Makefile
-obj-m += test.o actor.o
+filelist = *.c include/* Makefile actor.stp
+obj-m += bench.o actor.o
+
+actor-y := amain.o aproc.o
+
 
 all:
 	make -C $(LINUX) M=$(PWD) modules

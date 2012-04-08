@@ -25,7 +25,7 @@
 #	define A_NOINLINE	noinline
 #else
 #	define ADEBUG(name, format, ...)
-#	define A_NOINLINE
+#	define A_NOINLINE	noinline
 #endif
 
 #define ANAMEMAXLEN     16

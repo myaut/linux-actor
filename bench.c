@@ -49,9 +49,9 @@ int actor_test_callback(actor_t* self, amsg_hdr_t* msg) {
 
 	abp->i++;
 
-	return abp->is_done;
+	// return abp->is_done;
 
-	// return ACTOR_SUCCESS;
+	return ACTOR_SUCCESS;
 }
 
 void actor_init(void) {

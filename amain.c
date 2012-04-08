@@ -13,6 +13,7 @@
 #include <asm/bitops.h>
 
 #include <actor.h>
+#include <aproc.h>
 #include <hwtopo.h>
 
 /*Global cache for actor objects*/
@@ -78,6 +79,8 @@ int amod_init(void) {
 		return -EFAULT;
 	}
 	
+	aproc_init();
+
 	/*Initialize actor heads*/
 	HWTOPO_FOR_EACH_NODE(i) {
 		actor_node_init(i);
@@ -93,9 +96,13 @@ void amod_exit(void) {
 		set_bit(ACTOR_NODE_STOP, &actor_list[i].ah_flags);
 
 		/*Complete what is left and exit*/
-		wake_up_process(actor_list[i].ah_kthread);
+		kthread_stop(actor_list[i].ah_kthread);
+
+		aproc_free_head(&actor_list[i]);
 	}
-  
+
+	aproc_exit();
+
 	kfree(actor_list);
 
 	kmem_cache_destroy(actor_cache);
@@ -136,6 +143,11 @@ amsg_hdr_t* amsg_create(u32 untyped_num, u32 typed_num, int nodeid) {
     return msg;
 }
 EXPORT_SYMBOL_GPL(amsg_create);
+
+void amsg_free(amsg_hdr_t* msg) {
+	kfree(msg);
+}
+EXPORT_SYMBOL_GPL(amsg_free);
 
 static A_NOINLINE void actor_set_state(actor_t* ac, actor_state_t newstate) {
 	ADEBUG("actor_set_state", "Set state %s-%llu %d->%d\n", ac->a_name, ac->a_uid, ac->a_state, newstate);
@@ -207,6 +219,8 @@ actor_t* actor_create(u32 flags, u32 prio, int nodeid, char* name,
 
     actor_attach(ac);
 
+    aproc_create_actor(ac);
+
 	ADEBUG("actor_create", "Created new actor %s-%llu@%d [%p]\n", name, ac->a_uid, ac->a_nodeid, ac);
 	
 	return ac;
@@ -253,12 +267,14 @@ EXPORT_SYMBOL_GPL(actor_private_free);
  * @param ac pointer to actor
  */
 void actor_destroy(actor_t* ac) {
+	aproc_free_actor(ac);
+
 	spin_lock(&actor_list[ac->a_nodeid].ah_lock);
     list_del(&ac->a_list);
 	spin_unlock(&actor_list[ac->a_nodeid].ah_lock);
     
     ADEBUG("actor_destroy", "Destroyed actor %s-%llu@%d [%p]\n", ac->a_name, ac->a_uid, ac->a_nodeid, ac);
-    
+
     ac->a_dtor(ac);
 
     kmem_cache_free(actor_cache, ac);
@@ -310,6 +326,8 @@ static A_NOINLINE actor_work_t* actor_work_create(actor_t* ac, amsg_hdr_t* msg, 
 }
 
 void actor_work_free(actor_work_t* aw) {
+	amsg_free(aw->aw_msg);
+
 	kmem_cache_free(actor_work_cache, aw);
 }
 
@@ -340,17 +358,19 @@ static void actor_try_dispatch(actor_t* ac, actor_state_t new_state) {
  */
 int actor_communicate(actor_t* ac, amsg_hdr_t* msg, int blocked) {
 	actor_work_t* aw = NULL;
-	int nodeid = ac->a_nodeid;
 	
 	if(!ac)
 		return -EFAULT;
 	
+	if(ac->a_state == AS_NOT_INITIALIZED)
+		return -EINVAL;
+
 	aw = actor_work_create(ac, msg, blocked);
 	
 	if(!aw)
 		return -EFAULT;
 	
-	/*Now put actor work on lists and wait*/
+	/*Now put actor work on message queue and wait*/
     spin_lock(&(ac->a_msg_lock));  
     list_add_tail(&(aw->aw_list), &(ac->a_work_message));
 	spin_unlock(&(ac->a_msg_lock));
@@ -366,7 +386,9 @@ int actor_communicate(actor_t* ac, amsg_hdr_t* msg, int blocked) {
 	
 	if(blocked) {
     	wait_for_completion(&(aw->aw_wait));
+
     	actor_work_free(aw);
+
 	}
    
     return 0;
@@ -487,6 +509,10 @@ static void actor_node_init(int nodeid) {
 
 	ah->ah_kthread = kthread_create(actor_kthread, ah, "kactor-%d", nodeid);
 	kthread_bind(ah->ah_kthread, nodeid);
+
+	init_completion(&ah->ah_wait);
+
+	aproc_create_head(ah);
 }
 
 /*
@@ -558,8 +584,10 @@ void actor_node_process(struct actor_head* ah) {
 int actor_kthread_exec(struct actor_head* ah) {
 	/*Sleep until somebody will dispatch us*/
 	set_current_state(TASK_UNINTERRUPTIBLE);
-	while(!test_and_clear_bit(ACTOR_NODE_DISPATCHED, &(ah->ah_flags)))
+	while(!test_and_clear_bit(ACTOR_NODE_DISPATCHED, &(ah->ah_flags)) &&
+			!test_bit(ACTOR_NODE_STOP, &(ah->ah_flags))) {
 		schedule();
+	}
 	set_current_state(TASK_RUNNING);
 
 	actor_node_process(ah);
@@ -570,7 +598,7 @@ int actor_kthread_exec(struct actor_head* ah) {
 int actor_kthread(void* data) {
 	struct actor_head* ah = (struct actor_head*) data;
 	
-	while (!test_bit(ACTOR_NODE_STOP, &(ah->ah_flags))) {
+	while (!kthread_should_stop()) {
 		actor_kthread_exec(ah);
 	}
 
