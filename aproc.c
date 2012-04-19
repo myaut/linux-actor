@@ -65,8 +65,8 @@ void aproc_free_head(struct actor_head* ah) {
  * Routines for actors
  * */
 
-static const char* aproc_actor_state_str(actor_t* ac) {
-	switch(ac->a_state) {
+const char* aproc_actor_state_str(actor_state_t state) {
+	switch(state) {
 	case AS_NOT_INITIALIZED:
 		return "NOT_INIT";
 	case AS_STOPPED:
@@ -89,9 +89,12 @@ static int aproc_actor_show(struct seq_file* sf, void* v) {
 	seq_printf(sf, "Name: %s\n", ac->a_name);
 	seq_printf(sf, "Address: %p\n", ac);
 	seq_printf(sf, "Node: %d\n", ac->a_nodeid);
-	seq_printf(sf, "State: %s\n", aproc_actor_state_str(ac));
+	seq_printf(sf, "State: %s\n", aproc_actor_state_str(ac->a_state));
 	seq_printf(sf, "Priority: %d\n", ac->a_prio);
 	seq_printf(sf, "Last executed: %ld\n", ac->a_jiffies);
+
+	/*FIXME: pipelined actors*/
+	seq_printf(sf, "Callback: %p\n", ac->a_exec.a_function);
 
 	return 0;
 }

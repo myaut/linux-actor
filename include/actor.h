@@ -15,13 +15,14 @@
 #include <linux/printk.h>
 #include <linux/mutex.h>
 #include <linux/proc_fs.h>
+#include <linux/timer.h>
 
-// #define CONFIG_ACTOR_TRACE
+#define CONFIG_ACTOR_TRACE
 
 /*Actor debug routine*/
 #if defined(CONFIG_ACTOR_TRACE)
 #	define ADEBUG(name, format, ...) __actor_trace(name, format, __VA_ARGS__); \
- 							 	 	 ; /* printk(KERN_INFO "@%d " name ": " format, smp_processor_id(), __VA_ARGS__); */
+ 							 	 	 ; printk(KERN_INFO "@%d " name ": " format, smp_processor_id(), __VA_ARGS__);
 #	define A_NOINLINE	noinline
 #else
 #	define ADEBUG(name, format, ...)
@@ -85,7 +86,7 @@ struct actor;
 typedef struct actor actor_t;
 
 
-typedef int (*actor_ctor)(actor_t* self);
+typedef int (*actor_ctor)(actor_t* self, void* data);
 typedef int (*actor_dtor)(actor_t* self);
 
 /* Return values of actor callback
@@ -97,16 +98,20 @@ typedef int (*actor_dtor)(actor_t* self);
 /**
  * Actor callback function
  * must return 0 if message was processed or 1 if message should be blocked */
-typedef int (*actor_callback)(actor_t* self, amsg_hdr_t* msg);
+typedef int (*actor_callback)(actor_t* self, amsg_hdr_t* msg, int aw_flags);
 
 typedef enum {
 	AS_NOT_INITIALIZED,
     AS_STOPPED,
     AS_RUNNABLE,
 	AS_RUNNABLE_INCOMPLETE,
-	AS_EXECUTING,
+	AS_EXECUTING
 } actor_state_t;
 
+#define AW_NONE				0x0
+#define AW_BLOCKING 		0x1
+#define AW_COMMUNICATING	0x2
+#define AW_COMM_COMPLETE	0x4
 
 /*
  * Actor work is queue of messages which actor has to process.
@@ -117,17 +122,22 @@ struct actor_work {
     amsg_hdr_t* aw_msg;
     
     struct list_head aw_list;
-    struct completion aw_wait;
 
-    int aw_blocking;
+    struct completion aw_wait;	/*Waiter completion for external threads*/
+
+    struct actor_work* aw_wait_work;	/*Waiter blocked on actor_int_communicate*/
+
+    int aw_flags;
+
 };
 typedef struct actor_work actor_work_t;
 
 struct actor {
-    struct mutex a_mutex;		/* Protects actor state */
+    struct mutex a_mutex;		/* Protects a_state and a_list */
     
 	int a_nodeid;
 	u64 a_uid;
+	char a_name[ANAMEMAXLEN];
 
 	u16	a_flags;
 	u16 a_prio;					/*Actor priority*/
@@ -137,16 +147,12 @@ struct actor {
 	struct list_head a_list;			/*Per-node actor list*/
 	struct list_head a_acquaintance;	/*Actor acquaintances for
 										building actor topology*/
-	char a_name[ANAMEMAXLEN];
 	
 	actor_ctor a_ctor;
-	actor_ctor a_dtor;
+	actor_dtor a_dtor;
 
     union {
         struct {
-            actor_callback  preexec;
-            actor_callback  postexec;
-        
             actor_callback	pipeline[AMAXPIPELINE];
             u32             len;     
         } a_pipeline;
@@ -163,6 +169,7 @@ struct actor {
 
 	unsigned long		a_jiffies;		/*Last actor execution mark*/
 
+	void*				a_private_temp;
 	void* 			    a_private;		/*Private section that holds actor data*/
 	unsigned long		a_private_len;
 
@@ -175,21 +182,30 @@ enum actor_head_flag {
 	ACTOR_NODE_INIT,		/* There are uninitialized actors on this node*/
 	ACTOR_NODE_MIGRATE,		/* There are actors that need to complete migration*/
 
-	ACTOR_NODE_STOP
+	ACTOR_NODE_STOP,		/*Node is stopped*/
+	ACTOR_NODE_WAIT			/*There are waiters on node*/
 };
 
 /*Per-node actor list*/
 struct actor_head {
-    spinlock_t  ah_lock;			/*Protects ah_list*/
-    spinlock_t  ah_lock_init;		/*Protects ah_list_init*/
+	spinlock_t  ah_lock;			/*Protects queues except INIT/MIGR queues*/
+    spinlock_t  ah_lock_init;		/*Protects INIT queue*/
 
 	int		ah_nodeid;				/*Node number*/
 
-	struct list_head ah_list;		/*List for per-cpu actor*/
-	struct list_head ah_list_init;  /*List of actors which doesn't initialized yet*/
-	struct list_head ah_list_migr;  /*List of actors which was attached to this
+	struct list_head ah_queue_exec;		/*List for per-cpu actor*/
+	struct list_head ah_queue_init;  /*List of actors which doesn't initialized yet
+	 	 	 	 	 	 	 	 	 New actors may only attach to this queue*/
+	struct list_head ah_queue_migr;  /*List of actors which was attached to this
 	 	 	 	 	 	 	 	 	 node during migration and doesn't migrate their
 	 	 	 	 	 	 	 	 	 private data*/
+
+	struct list_head ah_queue_stop;	 /*Actors that stopped execution because they are processed
+	 	 	 	 	 	 	 	 	   their messages*/
+	struct list_head ah_queue_wait;	 /*Actors that incompleted execution (i.e. due to slice exhaustion
+	 	 	 	 	 	 	 	 	 waiting next cycle in this queue*/
+
+	unsigned ah_num_actors;			/*Number of actors attached to this node*/
 
 	unsigned long ah_flags;
 
@@ -198,13 +214,16 @@ struct actor_head {
 
 	struct proc_dir_entry* ah_proc_entry;
 	char ah_proc_name[APROC_HEAD_NAMELEN];
+
+	struct timer_list ah_timer;
 };
 
 actor_t* actor_create(u32 flags, u32 prio, int nodeid, char* name,
-			actor_ctor ctor, actor_dtor dtor, actor_callback f);
+			actor_ctor ctor, actor_dtor dtor, actor_callback f, void* data);
 void actor_destroy(actor_t* ac);
-actor_t* actor_byid(u64 id);
-int actor_communicate(actor_t* ac, amsg_hdr_t* msg, int blocked);
+
+int actor_communicate(actor_t* ac, amsg_hdr_t* msg);
+int actor_communicate_blocked(actor_t* ac, amsg_hdr_t* msg);
 
 amsg_hdr_t* amsg_create(u32 untyped_num, u32 typed_num, int nodeid);
 void amsg_free(amsg_hdr_t* msg);

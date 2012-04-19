@@ -11,10 +11,15 @@
 #include <linux/mutex.h>
 #include <linux/string.h>
 #include <asm/uaccess.h>
+#include <linux/cpumask.h>
 
 struct benchmark;
 
 MODULE_LICENSE("GPL");
+
+/*#####################
+ * Critical section benchmark
+ *#####################*/
 
 /**********************
  * ACTOR
@@ -26,7 +31,7 @@ typedef struct actor_bench_private {
 
 static actor_t* test_actor;
 
-int actor_test_ctor(actor_t* self) {
+int actor_test_ctor(actor_t* self, void* data) {
 	actor_bench_priv_t* abp = (actor_bench_priv_t*)
 			actor_private_allocate(self, sizeof(actor_bench_priv_t));
 
@@ -44,31 +49,35 @@ int actor_test_dtor(actor_t* self) {
 	return 0;
 }
 
-int actor_test_callback(actor_t* self, amsg_hdr_t* msg) {
+int actor_test_callback(actor_t* self, amsg_hdr_t* msg, int aw_flags) {
 	actor_bench_priv_t* abp = (actor_bench_priv_t*) self->a_private;
 
 	abp->i++;
 
-	// return abp->is_done;
+	return abp->is_done;
 
-	return ACTOR_SUCCESS;
+	// return ACTOR_SUCCESS;
 }
 
-void actor_init(void) {
+int actor_init(void) {
 	test_actor = actor_create(0, 0, smp_processor_id(),
 								"test", actor_test_ctor, actor_test_dtor,
-								actor_test_callback);
+								actor_test_callback, NULL);
+
+	return 0;
 }
 
-void actor_deinit(void) {
+int actor_deinit(void) {
 	actor_destroy(test_actor);
+
+	return 0;
 }
 
 int actor_bench(struct benchmark* b, void* data) {
 	amsg_hdr_t* msg = amsg_create(0, 0, test_actor->a_nodeid);
 
 	/*Message is freed on actor-side*/
-	return actor_communicate(test_actor, msg, 1);
+	return actor_communicate_blocked(test_actor, msg);
 }
 
 long actor_bench_results(struct benchmark* b) {
@@ -86,7 +95,7 @@ long actor_bench_results(struct benchmark* b) {
 
 static actor_t* test_multi_actor[NR_CPUS];
 
-void multi_actor_init(void) {
+int multi_actor_init(void) {
 	int i;
 
 	for_each_online_cpu(i) {
@@ -94,16 +103,21 @@ void multi_actor_init(void) {
 				actor_create(0, 0, i, "multi",
 							actor_test_ctor,
 							actor_test_dtor,
-							actor_test_callback);
+							actor_test_callback,
+							NULL);
 	}
+
+	return 0;
 }
 
-void multi_actor_deinit(void) {
+int multi_actor_deinit(void) {
 	int i;
 
 	for_each_online_cpu(i) {
 		actor_destroy(test_multi_actor[i]);
 	}
+
+	return 0;
 }
 
 int multi_actor_bench(struct benchmark* b, void* data) {
@@ -113,7 +127,7 @@ int multi_actor_bench(struct benchmark* b, void* data) {
 	amsg_hdr_t* msg = amsg_create(0, 0, nodeid);
 
 	/*Message is freed on actor-side*/
-	return actor_communicate(ac, msg, 1);
+	return actor_communicate_blocked(ac, msg);
 }
 
 long multi_actor_bench_results(struct benchmark* b) {
@@ -153,6 +167,7 @@ long atomic_bench_results(struct benchmark* b) {
 static long test_sl = 0;
 static DEFINE_SPINLOCK(test_lock);
 
+
 int spinlock_bench(struct benchmark* b, void* data) {
 	unsigned long flags = 0;
 
@@ -186,9 +201,236 @@ long mutex_bench_results(struct benchmark* b) {
 	return test_mtx;
 }
 
+
+/*#######################
+ *  Ping-Pong Benchmark
+ *#######################*/
+
+#define NUM_CLIENTS 64
+
+#define NUM_DOMAINS 8
+
 /********************
- * MAIN BENCHMARK ROUTINES
+ * ACTOR
  ********************/
+
+static atomic_t pp_actor_score;
+
+int pp_actor_is_done = 1;
+
+static actor_t* pp_actors[NUM_DOMAINS];
+
+struct pp_actor_priv {
+	actor_t* next;
+};
+
+int pp_actor_med_ctor(actor_t* self, void* data) {
+	struct pp_actor_priv* p =
+			actor_private_allocate(self, sizeof(struct pp_actor_priv));
+
+	p->next = (actor_t*) data;
+
+	return 0;
+}
+
+int pp_actor_med_cb(actor_t* ac, amsg_hdr_t* msg, int aw_flags) {
+	/*Send message to */
+	struct pp_actor_priv* p = (struct pp_actor_priv*) ac->a_private;
+
+	/*Forward message to next actor*/
+	actor_communicate_blocked(p->next, msg);
+
+	return pp_actor_is_done? ACTOR_SUCCESS : ACTOR_INCOMPLETE;
+}
+
+int pp_actor_last_cb(actor_t* ac, amsg_hdr_t* msg, int aw_flags) {
+	/*Last actor in chain simply returns success*/
+	atomic_inc(&pp_actor_score);
+
+	return ACTOR_SUCCESS;
+}
+
+int pp_actor_init(void) {
+	int ai = NUM_DOMAINS - 1;
+	int nodeid = smp_processor_id();
+	actor_t* prev = NULL;
+
+	//Last actor in chain
+	prev = actor_create(0, 0, nodeid, "pp_last", NULL, NULL, pp_actor_last_cb, NULL);
+	pp_actors[ai--] = prev;
+
+	pp_actor_is_done = 0;
+
+	for(; ai >= 0; --ai) {
+		nodeid = cpumask_next(nodeid, cpu_online_mask);
+
+		if(nodeid >= nr_cpu_ids)
+			nodeid = cpumask_first(cpu_online_mask);
+
+		prev = actor_create(0, 0, nodeid, "pp_med",
+							pp_actor_med_ctor,
+							NULL,
+							pp_actor_med_cb, (void*) prev);
+		pp_actors[ai] = prev;
+	}
+
+	return 0;
+}
+
+int pp_actor_deinit(void) {
+	int ai;
+
+	for(ai = 0; ai < NUM_DOMAINS; ++ai)
+		actor_destroy(pp_actors[ai]);
+
+	return 0;
+}
+
+int pp_actor_bench(struct benchmark* b, void* data) {
+	/*Send message to first actor and wait*/
+	amsg_hdr_t* msg = amsg_create(0, 0, smp_processor_id());
+
+	actor_communicate_blocked(pp_actors[0], msg);
+
+	return 0;
+}
+
+long pp_actor_bench_results(struct benchmark* b) {
+	pp_actor_is_done = 1;
+
+	return atomic_read(&pp_actor_score);
+}
+
+/********************
+ * THREAD
+ ********************/
+
+static atomic_t pp_thread_score;
+
+int pp_thread_is_done = 1;
+
+struct pp_thread_message {
+	struct list_head list;
+	struct completion com;
+};
+
+static struct pp_thread_struct {
+	struct task_struct* kthread;
+	struct pp_thread_struct* next;
+
+	struct list_head queue;
+	spinlock_t lock;
+} pp_threads[NUM_DOMAINS];
+
+int pp_thread_med(void* data) {
+	// transfer to next thread
+	struct list_head* l = NULL, *ln = NULL;
+
+	struct pp_thread_struct* thr = (struct pp_thread_struct*) data;
+	struct pp_thread_struct* next = thr->next;
+
+	while(!pp_thread_is_done) {
+		spin_lock(&thr->lock);
+
+		list_for_each_safe(l, ln, &thr->queue) {
+			list_del(l);
+
+			spin_lock(&next->lock);
+			list_add_tail(l, &next->queue);
+			spin_unlock(&next->lock);
+		}
+
+		wake_up_process(next->kthread);
+
+		spin_unlock(&thr->lock);
+
+		//Sleep
+		set_current_state(TASK_INTERRUPTIBLE);
+		schedule();
+		set_current_state(TASK_RUNNING);
+	}
+
+	return 0;
+}
+
+int pp_thread_last(void* data) {
+	struct list_head* l = NULL, *ln = NULL;
+
+	struct pp_thread_struct* thr = (struct pp_thread_struct*) data;
+	struct pp_thread_message* msg = NULL;
+
+	while(!pp_thread_is_done) {
+		spin_lock(&thr->lock);
+
+		list_for_each_safe(l, ln, &thr->queue) {
+			msg = (struct pp_thread_message*) list_entry(l, struct pp_thread_message, list);
+
+			list_del(l);
+			complete(&msg->com);
+
+			atomic_inc(&pp_thread_score);
+		}
+
+		spin_unlock(&thr->lock);
+
+		//Sleep
+		set_current_state(TASK_INTERRUPTIBLE);
+		schedule();
+		set_current_state(TASK_RUNNING);
+	}
+
+	return 0;
+}
+
+int pp_thread_init(void) {
+	int ti = NUM_DOMAINS - 1;
+
+	pp_thread_is_done = 0;
+
+	for(; ti >= 0; --ti) {
+		spin_lock_init(&(pp_threads[ti].lock));
+		INIT_LIST_HEAD(&(pp_threads[ti].queue));
+
+		pp_threads[ti].kthread = kthread_create((ti == NUM_DOMAINS - 1) ? pp_thread_last : pp_thread_med,
+								(void*) pp_threads + ti, "ppthread-%d", ti);
+		pp_threads[ti].next = (ti == NUM_DOMAINS - 1) ? NULL : pp_threads + ti + 1;
+	}
+
+	return 0;
+}
+
+int pp_thread_deinit(void) {
+	return 0;
+}
+
+int pp_thread_bench(struct benchmark* b, void* data) {
+	/*Send message to first actor and wait*/
+	struct pp_thread_message msg;
+	struct pp_thread_struct* thr = pp_threads;
+
+	INIT_LIST_HEAD(&msg.list);
+	init_completion(&msg.com);
+
+	spin_lock(&thr->lock);
+	list_add_tail(&msg.list, &thr->queue);
+	spin_unlock(&thr->lock);
+
+	wake_up_process(thr->kthread);
+	wait_for_completion(&msg.com);
+
+	return 0;
+}
+
+long pp_thread_bench_results(struct benchmark* b) {
+	pp_thread_is_done = 1;
+
+	return atomic_read(&pp_thread_score);
+}
+
+/*#######################
+ *  Main module
+ *#######################*/
+
 typedef enum bench_stage {
 	BENCH_NONE = -1,
 	BENCH_ACTOR,
@@ -196,40 +438,57 @@ typedef enum bench_stage {
 	BENCH_ATOMIC,
 	BENCH_SPIN,
 	BENCH_MUTEX,
+	BENCH_PP_ACTOR,
+	BENCH_PP_THREAD,
 	BENCH_DONE
 } bench_stage_t;
 
 struct benchmark {
 	const char* name;
 
+	int (*bench_init)(void);
+	int (*bench_deinit)(void);
+
 	int (*bench_func)(struct benchmark*, void* );
 	long (*bench_get_results)(struct benchmark* );
 };
 
-#define BENCH_DURATION 60
+#define BENCH_DURATION 10
 
 static volatile bench_stage_t benchmark_stage = BENCH_NONE;
 static struct timer_list bench_timer;
 
-struct task_struct* bench_threads[NR_CPUS] = {NULL};
+struct task_struct* bench_threads[NUM_CLIENTS] = {NULL};
 
 struct proc_dir_entry* test_proc_entry;
 
-#define BENCHMARK(bname)				\
-	{									\
-		.name = #bname , 				\
-		.bench_func = bname ## _bench,	\
-		.bench_get_results =			\
-			bname ## _bench_results		\
+#define BENCHMARK(bname)					\
+	{										\
+		.name = #bname , 					\
+		.bench_init = bname ## _init,		\
+		.bench_deinit = bname ## _deinit,	\
+		.bench_func = bname ## _bench,		\
+		.bench_get_results =				\
+			bname ## _bench_results			\
+	}
+
+#define BENCHMARK2(bname)					\
+	{										\
+		.name = #bname , 					\
+		.bench_func = bname ## _bench,		\
+		.bench_get_results =				\
+			bname ## _bench_results			\
 	}
 
 struct benchmark benchmarks[] =
 {
 	BENCHMARK(actor),
 	BENCHMARK(multi_actor),
-	BENCHMARK(atomic),
-	BENCHMARK(spinlock),
-	BENCHMARK(mutex)
+	BENCHMARK2(atomic),
+	BENCHMARK2(spinlock),
+	BENCHMARK2(mutex),
+	BENCHMARK(pp_actor),
+	BENCHMARK(pp_thread),
 };
 
 void set_benchmark_stage(int new_stage) {
@@ -314,7 +573,7 @@ int test_proc_write(struct file *file, const char *buffer, unsigned long count, 
 
 	set_benchmark_stage(new_stage);
 
-	for_each_online_cpu(i) {
+	for(i = 0; i < NUM_CLIENTS; ++i) {
 		bench_threads[i] = kthread_create(benchmark_thread, NULL, "bench-%d", i);
 		wake_up_process(bench_threads[i]);
 	}
@@ -322,10 +581,31 @@ int test_proc_write(struct file *file, const char *buffer, unsigned long count, 
 	return count;
 }
 
+int bench_init_benchmarks(void) {
+	int i = BENCH_NONE + 1;
+
+	for(; i < BENCH_DONE; ++i) {
+		if(benchmarks[i].bench_init)
+			benchmarks[i].bench_init();
+	}
+
+	return 0;
+}
+
+int bench_deinit_benchmarks(void) {
+	int i = BENCH_NONE + 1;
+
+	for(; i < BENCH_DONE; ++i) {
+		if(benchmarks[i].bench_deinit)
+			benchmarks[i].bench_deinit();
+	}
+
+	return 0;
+}
+
 int benchmark_init(void) {
-	actor_init();
-	multi_actor_init();
-	
+	bench_init_benchmarks();
+
 	if(IS_ERR(test_actor))
 		return PTR_ERR(test_actor);
 
@@ -352,8 +632,7 @@ void benchmark_exit(void) {
 
 	del_timer(&bench_timer);
 
-	actor_deinit();
-	multi_actor_deinit();
+	bench_deinit_benchmarks();
 }
 
 module_init(benchmark_init);
