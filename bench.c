@@ -237,6 +237,12 @@ int pp_actor_med_cb(actor_t* ac, amsg_hdr_t* msg, int aw_flags) {
 	/*Send message to */
 	struct pp_actor_priv* p = (struct pp_actor_priv*) ac->a_private;
 
+	/*Communication for msg is finished*/
+	if(aw_flags & AW_COMM_COMPLETE)
+		return ACTOR_SUCCESS;
+	
+	pr_notice("Communication: %p -> %p\n", ac, p->next);
+
 	/*Forward message to next actor*/
 	actor_communicate_blocked(p->next, msg);
 

@@ -8,8 +8,8 @@
 #ifndef APROC_H
 #define APROC_H
 
-int aproc_init(void);
-int aproc_exit(void);
+void aproc_init(void);
+void aproc_exit(void);
 
 int aproc_create_head(struct actor_head* ah);
 void aproc_free_head(struct actor_head* ah);

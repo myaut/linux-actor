@@ -7,11 +7,11 @@ static struct proc_dir_entry* aproc_root;
 /*
  * Common actor-procfs routines
  * */
-int aproc_init(void) {
+void aproc_init(void) {
 	aproc_root = proc_mkdir("actor", NULL);
 }
 
-int aproc_exit(void) {
+void aproc_exit(void) {
 	remove_proc_entry("actor", NULL);
 }
 

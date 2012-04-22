@@ -16,13 +16,14 @@
 #include <linux/mutex.h>
 #include <linux/proc_fs.h>
 #include <linux/timer.h>
+#include <linux/clocksource.h>
 
 #define CONFIG_ACTOR_TRACE
 
 /*Actor debug routine*/
-#if defined(CONFIG_ACTOR_TRACE)
+#ifdef CONFIG_ACTOR_TRACE
 #	define ADEBUG(name, format, ...) __actor_trace(name, format, __VA_ARGS__); \
- 							 	 	 ; printk(KERN_INFO "@%d " name ": " format, smp_processor_id(), __VA_ARGS__);
+									 ; printk(KERN_INFO "@%d " name ": " format, smp_processor_id(), __VA_ARGS__);
 #	define A_NOINLINE	noinline
 #else
 #	define ADEBUG(name, format, ...)
@@ -125,6 +126,7 @@ struct actor_work {
 
     struct completion aw_wait;	/*Waiter completion for external threads*/
 
+    atomic_t aw_count;					/*Count of referencing waiters*/
     struct actor_work* aw_wait_work;	/*Waiter blocked on actor_int_communicate*/
 
     int aw_flags;
@@ -166,6 +168,7 @@ struct actor {
 	
 	struct list_head    a_work_active;  /*Work queue which is currently processed*/
 	struct list_head    a_work_message;  /*Work queue to put messages*/
+	struct list_head	a_work_waiting;	/*Works waiting for finishing communication*/
 
 	unsigned long		a_jiffies;		/*Last actor execution mark*/
 
@@ -212,6 +215,8 @@ struct actor_head {
 	struct task_struct* ah_kthread;
 	struct completion ah_wait;		/*Thread completion*/
 
+	struct clocksource* ah_clock;
+
 	struct proc_dir_entry* ah_proc_entry;
 	char ah_proc_name[APROC_HEAD_NAMELEN];
 
@@ -220,6 +225,13 @@ struct actor_head {
 
 actor_t* actor_create(u32 flags, u32 prio, int nodeid, char* name,
 			actor_ctor ctor, actor_dtor dtor, actor_callback f, void* data);
+
+static actor_t* actor_create_simple(u32 flags, u32 prio, int nodeid, char* name,
+			actor_callback f) {
+	return actor_create(flags, prio, nodeid, name, NULL, NULL, f, NULL);
+}
+
+
 void actor_destroy(actor_t* ac);
 
 int actor_communicate(actor_t* ac, amsg_hdr_t* msg);
