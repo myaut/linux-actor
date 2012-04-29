@@ -15,7 +15,7 @@ int ct_send_func(actor_t* self, amsg_hdr_t* msg, int aw_flags) {
 
 	actor_communicate_blocked(recv, msg);
 
-	return ACTOR_SUCCESS;
+	return ACTOR_INCOMPLETE;
 }
 
 int ct_recv_func(actor_t* self, amsg_hdr_t* msg, int aw_flags) {

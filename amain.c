@@ -60,6 +60,19 @@ static void actor_try_dispatch(actor_t* ac, actor_state_t new_state);
 static void actor_node_init(int nodeid);
 static void actor_node_timer_func(unsigned long data);
 
+#define ACTOR_MAGIC_CHECK(ac)	\
+	BUG_ON((ac)->a_magic != ACTOR_MAGIC)
+
+static actor_work_t* get_current_work() {
+#ifdef CONFIG_ACTOR_DEBUG    
+    /* Curwork should be NULL if kactor-thread not on CPU */
+    BUG_ON( percpu_read_stable(actor_curwork) != NULL &&
+            current != actor_list[smp_processor_id()].ah_kthread);
+#endif
+    
+    return percpu_read_stable(actor_curwork);
+}
+	
 /*
 * actor_init_cache inits actor kmem cache
 * in case of fault returns -EFAULT
@@ -145,11 +158,13 @@ amsg_hdr_t* amsg_create(u32 untyped_num, u32 typed_num, int nodeid) {
     /* Allocate in uncached zone (DMA) to reduce number
      of cache misses when sender and receiver are located on
      different nodes*/
-    amsg_hdr_t* msg = kmalloc(sz, GFP_KERNEL | (HWTOPO_NODE_ISLOCAL(nodeid))? 0 : GFP_DMA);    
+    amsg_hdr_t* msg = kmalloc(sz, GFP_ATOMIC | (HWTOPO_NODE_ISLOCAL(nodeid))? 0 : GFP_DMA);
     
     if(!msg)
         return NULL;
     
+    atomic_set(&msg->am_count, 0);
+
     msg->len = sz;
     msg->untyped = (amsg_word_t*) (char*) msg + sizeof(amsg_hdr_t);
     msg->typed = (amsg_typed_t*) ((char*) msg->untyped + untyped_num * sizeof(amsg_word_t));
@@ -157,11 +172,6 @@ amsg_hdr_t* amsg_create(u32 untyped_num, u32 typed_num, int nodeid) {
     return msg;
 }
 EXPORT_SYMBOL_GPL(amsg_create);
-
-void amsg_free(amsg_hdr_t* msg) {
-	kfree(msg);
-}
-EXPORT_SYMBOL_GPL(amsg_free);
 
 extern const char* aproc_actor_state_str(actor_state_t ac);
 
@@ -221,11 +231,14 @@ actor_t* actor_create(u32 flags, u32 prio, int nodeid, char* name,
     
 	ac->a_flags = flags;
 	ac->a_prio = prio;
-
 	ac->a_exec.a_function = f;
 
 	ac->a_ctor = ctor;
 	ac->a_dtor = dtor;
+    
+#   ifdef CONFIG_ACTOR_DEBUG
+    ac->a_magic = ACTOR_MAGIC;
+#   endif
     
     strncpy(ac->a_name, name, ANAMEMAXLEN);
     ac->a_name[ANAMEMAXLEN - 1] = 0;
@@ -265,7 +278,7 @@ void* actor_private_allocate(actor_t* ac, unsigned long len) {
 	if(ac->a_private_len != 0)
 		return ERR_PTR(-EINVAL);
 
-	ac->a_private = kmalloc(len, GFP_KERNEL);
+	ac->a_private = kmalloc(len, GFP_ATOMIC);
 
 	if(!ac->a_private)
 		return ERR_PTR(-ENOMEM);
@@ -305,62 +318,61 @@ void actor_destroy(actor_t* ac) {
 }
 EXPORT_SYMBOL_GPL(actor_destroy);
 
-/**
- * 
- * 
- * TODO: Add search via local hash table
- */
-
-#if 0
-actor_t* actor_byid(u64 id) {
-    int nodeid = 0;
-    struct list_head  *l = NULL,
-                       *lh = NULL;
-    actor_t* a = NULL;
-    
-    HWTOPO_FOR_EACH_NODE(nodeid) {
-    	lh = &actor_list[nodeid].ah_list;
-
-		list_for_each(l, lh) {
-			a = container_of(l, actor_t, a_list);
-
-			if(a->a_uid == id)
-				return a;
-		}
-    }
-    
-    return NULL;
-}
-EXPORT_SYMBOL_GPL(actor_byid);
-#endif
 
 static actor_work_t* actor_work_create(actor_t* ac, amsg_hdr_t* msg, int flags) {
-	actor_work_t* aw = kmem_cache_alloc(actor_work_cache, GFP_KERNEL);
+	actor_work_t* aw = kmem_cache_alloc(actor_work_cache, GFP_ATOMIC);
 	
 	if(!aw)
 		return NULL;
 	
 	aw->aw_actor = ac;
+
+	atomic_inc(&msg->am_count);
 	aw->aw_msg = msg;
 	
 	aw->aw_wait_work = NULL;
 	aw->aw_flags = flags;
 
-	atomic_set(&aw->aw_count, 0);
+	atomic_set(&aw->aw_count, 1);
 
 	INIT_LIST_HEAD(&(aw->aw_list));
 	
 	init_completion(&(aw->aw_wait));
 
+#ifdef CONFIG_ACTOR_DEBUG
+	atomic_set(&aw->aw_hist_index, 0);
+#endif
+
 	return aw;
 }
 
-void actor_work_free(actor_work_t* aw) {
-	if(atomic_dec_and_test(&aw->aw_count)) {
-		amsg_free(aw->aw_msg);
+void actor_work_hold(actor_work_t* aw) {
+	atomic_inc(&aw->aw_count);
+	smp_mb();
+    
+	AWORK_HIST_ADD(aw, 'H');
+	ACTOR_MAGIC_CHECK(aw->aw_actor);
+}
+
+int actor_work_rele(actor_work_t* aw) {
+    int rc;
+    
+	ACTOR_MAGIC_CHECK(aw->aw_actor);
+	AWORK_HIST_ADD(aw, 'R');
+	
+	rc = atomic_dec_and_test(&aw->aw_count);
+    smp_mb();
+    
+    if(rc) {  
+		if(atomic_dec_and_test(&aw->aw_msg->am_count))
+			kfree(aw->aw_msg);
 
 		kmem_cache_free(actor_work_cache, aw);
+
+		return 1;
 	}
+
+	return 0;
 }
 
 /**
@@ -372,11 +384,15 @@ static void actor_try_dispatch(actor_t* ac, actor_state_t new_state) {
 	ADEBUG("actor_try_dispatch", "Trying to dispatch actor %s-%llu@%d [%p] with state=%s",
 			 	 ac->a_name, ac->a_uid, ac->a_nodeid, ac, aproc_actor_state_str(new_state));
 
+	ACTOR_MAGIC_CHECK(ac);
 	actor_set_state(ac, new_state);
 	
 	/*Attach to waiters queue if needed*/
 	if(new_state == AS_RUNNABLE || new_state == AS_RUNNABLE_INCOMPLETE) {
+		BUG_ON(!mutex_is_locked(&ac->a_mutex));
+
 		spin_lock(&ah->ah_lock);
+		list_del(&ac->a_list);
 		list_add_tail(&ac->a_list, &ah->ah_queue_wait);
 		spin_unlock(&ah->ah_lock);
 	}
@@ -384,20 +400,35 @@ static void actor_try_dispatch(actor_t* ac, actor_state_t new_state) {
 	/*Bit wasn't set, ensure that kthread will be dispatched*/
 	if(!test_and_set_bit(ACTOR_NODE_DISPATCHED, &(ah->ah_flags)))
 		wake_up_process(ah->ah_kthread);
+
+	ACTOR_MAGIC_CHECK(ac);
 }
 
 void actor_put_work(actor_t* ac, actor_work_t* aw) {
 	ADEBUG("actor_put_work", "Put work %s[%d] -> %s-%llu@%d [%p] work: %p\n",
 		    current->comm, current->pid, ac->a_name, ac->a_uid, ac->a_nodeid, ac, aw );
+
+#ifdef CONFIG_ACTOR_DEBUG
+	ACTOR_MAGIC_CHECK(ac);
+	BUG_ON(aw->aw_actor != ac);
+#endif
+	
+	AWORK_HIST_ADD(aw, 'P');
 	
 	/*Now put actor work on message queue*/
     spin_lock(&(ac->a_msg_lock));  
     list_add_tail(&(aw->aw_list), &(ac->a_work_message));
+	smp_mb();
 	spin_unlock(&(ac->a_msg_lock));
     
-	/* FIXME: may sleep on inter-actor communication which is bad */
-	mutex_lock(&ac->a_mutex);
-
+	/* Cannot sleep when in-actor communication is made because
+     * it may cause thread switch and break atomic actor execution
+     * 
+     * Workaround: make mutex act like spin_lock */
+    
+    while(!mutex_trylock(&ac->a_mutex)) 
+        cpu_relax();
+    
 	/* If actor was stopped - need redispatch him
 	 * or it will be redispatched when actor_execute detects
 	 * that queue is not empty*/
@@ -421,29 +452,34 @@ EXPORT_SYMBOL_GPL(actor_communicate);
 
 int actor_communicate_blocked(actor_t* ac, amsg_hdr_t* msg) {
 	actor_work_t* aw = actor_work_create(ac, msg, AW_BLOCKING);
-	actor_work_t* curwork = NULL;
-
+    actor_work_t* curwork = get_current_work();
+    
 	if(likely(aw)) {
-		curwork = get_cpu_var(actor_curwork);
-		put_cpu_var(actor_curwork);
-
 		if(!curwork) {
 			/*THREAD -> ACTOR, threads may sleep*/
+			AWORK_HIST_ADD(aw, 'T');
+                        
+			actor_work_hold(aw);
+			
 			actor_put_work(ac, aw);
-			atomic_inc(&aw->aw_count);
-
 			wait_for_completion(&(aw->aw_wait));
-			actor_work_free(aw);
+			
+			actor_work_rele(aw);
 		}
 		else {
-			/*ACTOR -> ACTOR*/
-			atomic_inc(&curwork->aw_count);
+			/*ACTOR -> ACTOR*/         
+			AWORK_HIST_ADD(aw, 'A');
+            AWORK_HIST_ADD(curwork, '>');
 
+			actor_work_hold(curwork);
 			aw->aw_wait_work = curwork;
+			
 			curwork->aw_flags |= AW_COMMUNICATING;
 
 			actor_put_work(ac, aw);
 		}
+
+		ACTOR_MAGIC_CHECK(ac);
 
 		return 0;
 	}
@@ -458,10 +494,9 @@ EXPORT_SYMBOL_GPL(actor_communicate_blocked);
  * @param ac actor
  */
 A_NOINLINE void actor_queue_join(actor_t* ac)  {
-    spin_lock(&ac->a_msg_lock);  
-	
+    spin_lock(&ac->a_msg_lock);
     list_splice_init(&ac->a_work_message, &ac->a_work_active);
-    
+	smp_mb();	/*work_message reinitiated, say this to other nodes*/
     spin_unlock(&ac->a_msg_lock);
 }
 
@@ -480,24 +515,36 @@ A_NOINLINE int actor_queue_isempty(actor_t* ac)  {
  *
  * TODO: pipelined actors
  * */
-int actor_execute_work(actor_work_t* aw) {
-	actor_t* ac = aw->aw_actor;
-
+int actor_execute_work(actor_t* ac, actor_work_t* aw) {
+	int rc;
+	
+	ACTOR_MAGIC_CHECK(ac);
+	AWORK_HIST_ADD(aw, '1');
+	
 	ADEBUG("actor_execute", "Processing work %p for actor %s-%llu exec: %p\n", aw, ac->a_name, ac->a_uid,
 	        		ac->a_exec.a_function);
+    
+    preempt_disable();
+    percpu_write(actor_curwork, aw);
+    
+	rc = (ac->a_exec.a_function(ac, aw->aw_msg, aw->aw_flags) == ACTOR_SUCCESS);
+    
+    percpu_write(actor_curwork, NULL);
+	preempt_enable();
+    
+	ACTOR_MAGIC_CHECK(ac);
+	AWORK_HIST_ADD(aw, '2');
 	
-	return ac->a_exec.a_function(ac, aw->aw_msg, aw->aw_flags) == 0;
+	return rc;
 }
 
 void actor_finish_work(actor_work_t* aw) {
 	actor_t* awaken = NULL;
 	actor_work_t* wait_work = NULL;
 
-	if(unlikely(!(aw->aw_flags & AW_BLOCKING))) {
-		/* Unblocked communications are freed on receiver side*/
-		actor_work_free(aw);
-	}
-	else {
+	AWORK_HIST_ADD(aw, 'F');
+	
+	if(likely(aw->aw_flags & AW_BLOCKING)) {
 		if(!aw->aw_wait_work) {
 			complete(&(aw->aw_wait));
 		}
@@ -506,16 +553,24 @@ void actor_finish_work(actor_work_t* aw) {
 			wait_work = aw->aw_wait_work;
 			awaken = wait_work->aw_actor;
 			
-			ADEBUG("actor_finish_work", "Releasing waiter %s-%llu %p\n", awaken->a_name, awaken->a_uid, awaken);
+			ACTOR_MAGIC_CHECK(awaken);
 
-			wait_work->aw_flags &= ~AW_COMMUNICATING;
+			ADEBUG("actor_finish_work", "Releasing waiter %s-%llu %p\n", awaken->a_name, awaken->a_uid, awaken);
+			
 			wait_work->aw_flags |= AW_COMM_COMPLETE;
+
+#ifdef CONFIG_ACTOR_DEBUG
+			/* Work shouldn't be freed this time because it has to be redispatched*/
+			BUG_ON(actor_work_rele(wait_work));
+#else
+			actor_work_rele(wait_work);
+#endif
 			
 			actor_put_work(awaken, wait_work);
-
-			actor_work_free(aw);
 		}
 	}
+
+	actor_work_rele(aw);
 }
 
 int actor_select_queue(actor_t* ac, struct actor_head* ah, int actor_complete) {
@@ -540,6 +595,10 @@ int actor_select_queue(actor_t* ac, struct actor_head* ah, int actor_complete) {
 		}
 	}
 
+#ifdef CONFIG_ACTOR_DEBUG
+	BUG_ON(!mutex_is_locked(&ac->a_mutex));
+#endif
+	
 	spin_lock(&ah->ah_lock);
 	actor_set_state(ac, next_state);
 	list_add_tail(&ac->a_list, next_queue);
@@ -555,22 +614,15 @@ int actor_select_queue(actor_t* ac, struct actor_head* ah, int actor_complete) {
  * 
  * @param ac actor to execute
  */
-int actor_execute(actor_t* ac, struct actor_head* ah, cycle_t tm_end) {
+int actor_execute(actor_t* ac, struct actor_head* ah) {
     struct list_head *l = NULL, *ln = NULL;
     actor_work_t* aw = NULL;
-    int actor_complete = 0, work_complete = 0;
-
-#ifdef 0
-    struct timespec ts_now;
-#else
-    cycle_t tm_now = clock->read(clock);
-#endif
+    int actor_complete = 1, work_complete = 0;
 
     actor_queue_join(ac);
 
     /* Messaging queue was empty too, discard actor */
     if(list_empty(&ac->a_work_active)) {
-    	actor_complete = 1;
     	goto out;
     }
 
@@ -580,52 +632,38 @@ int actor_execute(actor_t* ac, struct actor_head* ah, cycle_t tm_end) {
 	/*No need to hold a_mutex while we are processing works*/
 	mutex_unlock(&ac->a_mutex);
 
-	while(!actor_complete) {
-		actor_complete = 1;
+	list_for_each_safe(l, ln, &ac->a_work_active) {
+		aw = (actor_work_t*) list_entry(l, actor_work_t, aw_list);
 
-		list_for_each_safe(l, ln, &ac->a_work_active) {
-			aw = (actor_work_t*) list_entry(l, actor_work_t, aw_list);
+		ACTOR_MAGIC_CHECK(aw->aw_actor);
 
-			/* Set current work pointer*/
-			get_cpu_var(actor_curwork) = aw;
-			put_cpu_var(actor_curwork);
-
-			work_complete = actor_execute_work(aw);
-			actor_complete &= work_complete;
-
-			list_del(l);
-			
-			if(work_complete) {
-				actor_finish_work(aw);
+		/* Unlink curwork */
+		list_del(l);
+		
+        /* FIXME: Must use communicating counter */
+		aw->aw_flags &= ~AW_COMMUNICATING;
+    
+		work_complete = actor_execute_work(ac, aw);
+		actor_complete &= work_complete;
+		
+		if(!(aw->aw_flags & AW_COMMUNICATING)) {
+			if(!work_complete) {
+				/*Put unfinished works in front of message queue*/
+				AWORK_HIST_ADD(aw, 'I');
+				
+			    spin_lock(&(ac->a_msg_lock));
+			    list_add(l, &(ac->a_work_message));
+			    smp_mb();
+				spin_unlock(&(ac->a_msg_lock));
+				
+				actor_put_work(ac, aw);
 			}
 			else {
-				if(!(aw->aw_flags & AW_COMMUNICATING)) {
-					list_add_tail(l, &ac->a_work_active);
-				}
-				/*No need to track communicating works, 
-				 *will be attached by remote-side*/
+				actor_finish_work(aw);
 			}
-
-#if 0
-			getnstimeofday(&ts_now);
-			if(timespec_compare(&ts_now, &ts_end) >= 0) {
-				actor_complete = 0;
-				goto finish;
-			}
-#else
-			tm_now = clock->read(clock);
-			if(tm_now > tm_end) {
-				actor_complete = 0;
-				goto finish;
-			}
-#endif
 		}
 	}
-
-finish:
-	get_cpu_var(actor_curwork) = NULL;
-	put_cpu_var(actor_curwork);
-
+	
     ADEBUG("actor_execute_done", "Executed actor %s-%llu\n", ac->a_name, ac->a_uid);
 
 	mutex_lock(&ac->a_mutex);
@@ -659,8 +697,6 @@ static void actor_node_init(int nodeid) {
 
 	init_completion(&ah->ah_wait);
 
-	ah->ah_clock = clock_default_clocksource();
-
 	init_timer(&ah->ah_timer);
 	setup_timer(&ah->ah_timer, actor_node_timer_func, (unsigned long) ah);
 
@@ -687,7 +723,11 @@ void actor_node_init_actors(struct actor_head* ah) {
 		++ah->ah_num_actors;
 
 		/*New messages may arrive while we are initializing actor*/
+		while(!mutex_trylock(&a->a_mutex))
+            cpu_relax();
+        
 		actor_select_queue(a, ah, 1);
+		mutex_unlock(&a->a_mutex);
 	}
 	spin_unlock(&(ah->ah_lock_init));
 }
@@ -705,46 +745,31 @@ void actor_node_init_actors(struct actor_head* ah) {
 					&ah->ah_queue_exec);		\
 		spin_unlock(&ah->ah_lock);
 
-int __actor_node_process(struct actor_head* ah, cycles_t ts_end) {
+int __actor_node_process(struct actor_head* ah) {
     struct list_head  *l = NULL, *ln = NULL;
 
     actor_t* a = NULL;
     int node_processed = 1, actor_complete = 0;
-
-#if 0
-    struct timespec ts_actor_end, ts_now, ts_actor_slice;
-#else
-
-#endif
 
     /* No actors are attached to this node.
      * Strange but OK*/
     if(ah->ah_num_actors == 0)
     	return 1;
 
-#if 0
-    getnstimeofday(&ts_now);
-    ts_actor_slice = timespec_sub(ts_end, ts_now);
-    ts_actor_slice.tv_nsec /= ah->ah_num_actors;
-#else
-
-#endif
 	/*Execute actors for CURRENT node*/
 	list_for_each_safe(l, ln, &ah->ah_queue_exec) {
 		a = list_entry(l, actor_t, a_list);
 
-#if 0
-		getnstimeofday(&ts_now);
-		ts_actor_end = timespec_add(ts_now, ts_actor_slice);
-#else
-
-#endif
 		/*
 		 * 0 - actor was executed but didn't completed
 		 * 1 - actor was completed or wasn't executed
 		 * */
 		actor_complete = 1;
-
+        
+#   ifdef CONFIG_ACTOR_DEBUG
+        ;
+#   endif
+        
 		mutex_lock(&(a->a_mutex));
 
 		list_del(l);
@@ -753,20 +778,11 @@ int __actor_node_process(struct actor_head* ah, cycles_t ts_end) {
 		 or it was not processed successfully during last timeslice*/
 		if(a->a_state == AS_RUNNABLE ||
 		   a->a_state == AS_RUNNABLE_INCOMPLETE)
-			actor_complete = actor_execute(a, ah, ts_actor_end);
+			actor_complete = actor_execute(a, ah);
 
 		actor_complete = actor_select_queue(a, ah, actor_complete);
 
 		mutex_unlock(&(a->a_mutex));
-
-#if 0
-		/* Timeslice exhausted */
-		getnstimeofday(&ts_now);
-		if(timespec_compare(&ts_now, &ts_end) >= 0) {
-			break;
-		}
-#else
-#endif
 	}
 	
 	/*Check queues*/
@@ -782,18 +798,6 @@ int actor_node_process(struct actor_head* ah) {
 	int node_processed = 0;
 
 	/*Scheduler timing structures*/
-#if 0
-	struct timespec ts_end, ts_now;
-	u64 time_slice = NSEC_PER_USEC * jiffies_to_usecs(1);
-
-	struct timespec ts_slice = { .tv_sec = 0,
-			.tv_nsec = time_slice };
-
-	getnstimeofday(&ts_now);
-	ts_end = timespec_add(ts_now, ts_slice);
-#else
-
-#endif
 
     ADEBUG("actor_node_process", "Actor node process @%d\n", ah->ah_nodeid);
 
@@ -803,7 +807,7 @@ int actor_node_process(struct actor_head* ah) {
     /*Attach all waiters*/
     ATTACH_NODE_QUEUE(ah, ah_queue_wait);
 
-    node_processed = __actor_node_process(ah, ts_end);
+    node_processed = __actor_node_process(ah);
 
     if(!node_processed) {
     	set_bit(ACTOR_NODE_DISPATCHED, &ah->ah_flags);

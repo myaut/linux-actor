@@ -241,12 +241,10 @@ int pp_actor_med_cb(actor_t* ac, amsg_hdr_t* msg, int aw_flags) {
 	if(aw_flags & AW_COMM_COMPLETE)
 		return ACTOR_SUCCESS;
 	
-	pr_notice("Communication: %p -> %p\n", ac, p->next);
-
 	/*Forward message to next actor*/
 	actor_communicate_blocked(p->next, msg);
 
-	return pp_actor_is_done? ACTOR_SUCCESS : ACTOR_INCOMPLETE;
+	return ACTOR_SUCCESS;
 }
 
 int pp_actor_last_cb(actor_t* ac, amsg_hdr_t* msg, int aw_flags) {
@@ -325,7 +323,7 @@ static struct pp_thread_struct {
 	struct pp_thread_struct* next;
 
 	struct list_head queue;
-	spinlock_t lock;
+	mutex_t lock;
 } pp_threads[NUM_DOMAINS];
 
 int pp_thread_med(void* data) {
@@ -336,19 +334,19 @@ int pp_thread_med(void* data) {
 	struct pp_thread_struct* next = thr->next;
 
 	while(!pp_thread_is_done) {
-		spin_lock(&thr->lock);
+		mutex_lock(&thr->lock);
 
 		list_for_each_safe(l, ln, &thr->queue) {
 			list_del(l);
 
-			spin_lock(&next->lock);
+			mutex_lock(&next->lock);
 			list_add_tail(l, &next->queue);
-			spin_unlock(&next->lock);
+			mutex_unlock(&next->lock);
 		}
 
 		wake_up_process(next->kthread);
 
-		spin_unlock(&thr->lock);
+		mutex_unlock(&thr->lock);
 
 		//Sleep
 		set_current_state(TASK_INTERRUPTIBLE);
@@ -366,7 +364,7 @@ int pp_thread_last(void* data) {
 	struct pp_thread_message* msg = NULL;
 
 	while(!pp_thread_is_done) {
-		spin_lock(&thr->lock);
+		mutex_lock(&thr->lock);
 
 		list_for_each_safe(l, ln, &thr->queue) {
 			msg = (struct pp_thread_message*) list_entry(l, struct pp_thread_message, list);
@@ -377,7 +375,7 @@ int pp_thread_last(void* data) {
 			atomic_inc(&pp_thread_score);
 		}
 
-		spin_unlock(&thr->lock);
+		mutex_unlock(&thr->lock);
 
 		//Sleep
 		set_current_state(TASK_INTERRUPTIBLE);
@@ -394,12 +392,12 @@ int pp_thread_init(void) {
 	pp_thread_is_done = 0;
 
 	for(; ti >= 0; --ti) {
-		spin_lock_init(&(pp_threads[ti].lock));
+		mutex_init(&(pp_threads[ti].lock));
 		INIT_LIST_HEAD(&(pp_threads[ti].queue));
 
 		pp_threads[ti].kthread = kthread_create((ti == NUM_DOMAINS - 1) ? pp_thread_last : pp_thread_med,
 								(void*) pp_threads + ti, "ppthread-%d", ti);
-		pp_threads[ti].next = (ti == NUM_DOMAINS - 1) ? NULL : pp_threads + ti + 1;
+		pp_threads[ti].next = (ti == NUM_DOMAINS - 1) ? NULL : pp_threads + ti;
 	}
 
 	return 0;

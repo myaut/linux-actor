@@ -19,11 +19,12 @@
 #include <linux/clocksource.h>
 
 #define CONFIG_ACTOR_TRACE
+#define CONFIG_ACTOR_DEBUG
 
 /*Actor debug routine*/
 #ifdef CONFIG_ACTOR_TRACE
 #	define ADEBUG(name, format, ...) __actor_trace(name, format, __VA_ARGS__); \
-									 ; printk(KERN_INFO "@%d " name ": " format, smp_processor_id(), __VA_ARGS__);
+									 ; /* printk(KERN_INFO "@%d " name ": " format, smp_processor_id(), __VA_ARGS__); */
 #	define A_NOINLINE	noinline
 #else
 #	define ADEBUG(name, format, ...)
@@ -65,10 +66,12 @@ typedef struct {
     u32   sz;
 } amsg_typed_t;
 
-/*Header for actor request*/
+/*Header for actor request*/ 
 struct amsg_hdr {
     u32     len;
     
+    atomic_t		am_count;		/*Reference count*/
+
     amsg_word_t      result;
     amsg_word_t*     untyped;
     amsg_typed_t*    typed;
@@ -96,6 +99,8 @@ typedef int (*actor_dtor)(actor_t* self);
 #define 	ACTOR_SUCCESS		0
 #define 	ACTOR_INCOMPLETE	1
 
+#define     ACTOR_MAGIC         0xAC1900AC
+
 /**
  * Actor callback function
  * must return 0 if message was processed or 1 if message should be blocked */
@@ -118,6 +123,24 @@ typedef enum {
  * Actor work is queue of messages which actor has to process.
  * 
  */
+
+#ifdef CONFIG_ACTOR_DEBUG
+#define AWORK_HIST_LEN		32
+#define AWORK_HIST_ADD_2(aw, op, arg)							\
+	{ long hi = atomic_inc_return(&aw->aw_hist_index);			\
+	if(hi < AWORK_HIST_LEN) {   								\
+		aw->aw_hist[hi].h_op = op;								\
+		aw->aw_hist[hi].h_ret_ip = _RET_IP_;					\
+		aw->aw_hist[hi].h_comm =  current->comm;				\
+	} }															\
+
+#define AWORK_HIST_ADD(aw, op) AWORK_HIST_ADD_2(aw, op, 0UL)
+
+#else
+#define AWORK_HIST_ADD2(aw, op, arg)
+#define AWORK_HIST_ADD(aw, op)
+#endif
+
 struct actor_work {
     actor_t*    aw_actor;
     amsg_hdr_t* aw_msg;
@@ -131,10 +154,22 @@ struct actor_work {
 
     int aw_flags;
 
+#ifdef CONFIG_ACTOR_DEBUG
+	struct {
+		char h_op;				 /*Operation (HOLD/RELE)*/
+		unsigned long h_ret_ip;  /*_RET_IP_ value*/
+		char* h_comm;	 		 /*Current task*/
+	} aw_hist[AWORK_HIST_LEN];
+	atomic_t aw_hist_index;
+#endif
 };
 typedef struct actor_work actor_work_t;
 
 struct actor {
+#   ifdef CONFIG_ACTOR_DEBUG
+    unsigned long a_magic;
+#   endif    
+
     struct mutex a_mutex;		/* Protects a_state and a_list */
     
 	int a_nodeid;
@@ -214,8 +249,6 @@ struct actor_head {
 
 	struct task_struct* ah_kthread;
 	struct completion ah_wait;		/*Thread completion*/
-
-	struct clocksource* ah_clock;
 
 	struct proc_dir_entry* ah_proc_entry;
 	char ah_proc_name[APROC_HEAD_NAMELEN];
