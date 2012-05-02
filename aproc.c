@@ -75,6 +75,8 @@ const char* aproc_actor_state_str(actor_state_t state) {
 		return "RUN";
 	case AS_RUNNABLE_INCOMPLETE:
 		return "RUN(I)";
+    case AS_FROZEN:
+        return "FRO";
 	case AS_EXECUTING:
 		return "EXC";
 	}

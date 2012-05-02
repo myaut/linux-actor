@@ -54,9 +54,7 @@ int actor_test_callback(actor_t* self, amsg_hdr_t* msg, int aw_flags) {
 
 	abp->i++;
 
-	return abp->is_done;
-
-	// return ACTOR_SUCCESS;
+	return ACTOR_SUCCESS;
 }
 
 int actor_init(void) {
@@ -77,7 +75,7 @@ int actor_bench(struct benchmark* b, void* data) {
 	amsg_hdr_t* msg = amsg_create(0, 0, test_actor->a_nodeid);
 
 	/*Message is freed on actor-side*/
-	return actor_communicate_blocked(test_actor, msg);
+	return actor_communicate_async(test_actor, msg);
 }
 
 long actor_bench_results(struct benchmark* b) {
@@ -127,7 +125,7 @@ int multi_actor_bench(struct benchmark* b, void* data) {
 	amsg_hdr_t* msg = amsg_create(0, 0, nodeid);
 
 	/*Message is freed on actor-side*/
-	return actor_communicate_blocked(ac, msg);
+	return actor_communicate_async(ac, msg);
 }
 
 long multi_actor_bench_results(struct benchmark* b) {
@@ -206,9 +204,9 @@ long mutex_bench_results(struct benchmark* b) {
  *  Ping-Pong Benchmark
  *#######################*/
 
-#define NUM_CLIENTS 64
+#define NUM_CLIENTS 32
 
-#define NUM_DOMAINS 8
+#define NUM_DOMAINS 16
 
 /********************
  * ACTOR
@@ -309,7 +307,7 @@ long pp_actor_bench_results(struct benchmark* b) {
  * THREAD
  ********************/
 
-static atomic_t pp_thread_score;
+static long pp_thread_score = 0;
 
 int pp_thread_is_done = 1;
 
@@ -323,8 +321,33 @@ static struct pp_thread_struct {
 	struct pp_thread_struct* next;
 
 	struct list_head queue;
-	mutex_t lock;
+	struct mutex lock;
 } pp_threads[NUM_DOMAINS];
+
+void pp_thread_forward(struct list_head* l, struct pp_thread_struct* next) {
+	list_del(l);
+
+	mutex_lock(&next->lock);
+	list_add_tail(l, &next->queue);
+	mutex_unlock(&next->lock);
+}
+
+int pp_thread_complete(struct list_head* q) {
+    struct list_head* l = NULL, *ln = NULL;
+    struct pp_thread_message* msg = NULL;    
+    int n = 0;
+    
+    list_for_each_safe(l, ln, q) {
+        msg = (struct pp_thread_message*) list_entry(l, struct pp_thread_message, list);
+
+        list_del(l);
+        complete(&msg->com);
+
+        ++n;
+    }
+    
+    return n;
+}
 
 int pp_thread_med(void* data) {
 	// transfer to next thread
@@ -333,56 +356,44 @@ int pp_thread_med(void* data) {
 	struct pp_thread_struct* thr = (struct pp_thread_struct*) data;
 	struct pp_thread_struct* next = thr->next;
 
+    struct list_head actq;
+    
 	while(!pp_thread_is_done) {
+        INIT_LIST_HEAD(&actq);
+        
+        /*Switch queues*/
 		mutex_lock(&thr->lock);
-
-		list_for_each_safe(l, ln, &thr->queue) {
-			list_del(l);
-
-			mutex_lock(&next->lock);
-			list_add_tail(l, &next->queue);
-			mutex_unlock(&next->lock);
+        list_splice_init(&thr->queue, &actq);
+        mutex_unlock(&thr->lock);
+        
+		list_for_each_safe(l, ln, &actq) {
+			pp_thread_forward(l, next);
 		}
 
 		wake_up_process(next->kthread);
-
-		mutex_unlock(&thr->lock);
-
-		//Sleep
-		set_current_state(TASK_INTERRUPTIBLE);
-		schedule();
-		set_current_state(TASK_RUNNING);
+        
+		might_sleep();
 	}
 
+	pp_thread_complete(&thr->queue);
+	
 	return 0;
 }
 
 int pp_thread_last(void* data) {
-	struct list_head* l = NULL, *ln = NULL;
-
 	struct pp_thread_struct* thr = (struct pp_thread_struct*) data;
-	struct pp_thread_message* msg = NULL;
-
+    
 	while(!pp_thread_is_done) {
 		mutex_lock(&thr->lock);
-
-		list_for_each_safe(l, ln, &thr->queue) {
-			msg = (struct pp_thread_message*) list_entry(l, struct pp_thread_message, list);
-
-			list_del(l);
-			complete(&msg->com);
-
-			atomic_inc(&pp_thread_score);
-		}
-
+        pp_thread_score += pp_thread_complete(&thr->queue);
 		mutex_unlock(&thr->lock);
 
 		//Sleep
-		set_current_state(TASK_INTERRUPTIBLE);
-		schedule();
-		set_current_state(TASK_RUNNING);
+		might_sleep();
 	}
 
+	pp_thread_complete(&thr->queue);
+	
 	return 0;
 }
 
@@ -396,8 +407,8 @@ int pp_thread_init(void) {
 		INIT_LIST_HEAD(&(pp_threads[ti].queue));
 
 		pp_threads[ti].kthread = kthread_create((ti == NUM_DOMAINS - 1) ? pp_thread_last : pp_thread_med,
-								(void*) pp_threads + ti, "ppthread-%d", ti);
-		pp_threads[ti].next = (ti == NUM_DOMAINS - 1) ? NULL : pp_threads + ti;
+								(void*) (pp_threads + ti), "ppthread-%d", ti);
+		pp_threads[ti].next = (ti == NUM_DOMAINS - 1) ? NULL : pp_threads + ti + 1;
 	}
 
 	return 0;
@@ -410,14 +421,14 @@ int pp_thread_deinit(void) {
 int pp_thread_bench(struct benchmark* b, void* data) {
 	/*Send message to first actor and wait*/
 	struct pp_thread_message msg;
-	struct pp_thread_struct* thr = pp_threads;
+	struct pp_thread_struct* thr = &pp_threads[0];
 
 	INIT_LIST_HEAD(&msg.list);
 	init_completion(&msg.com);
 
-	spin_lock(&thr->lock);
+	mutex_lock(&thr->lock);
 	list_add_tail(&msg.list, &thr->queue);
-	spin_unlock(&thr->lock);
+	mutex_unlock(&thr->lock);
 
 	wake_up_process(thr->kthread);
 	wait_for_completion(&msg.com);
@@ -428,7 +439,7 @@ int pp_thread_bench(struct benchmark* b, void* data) {
 long pp_thread_bench_results(struct benchmark* b) {
 	pp_thread_is_done = 1;
 
-	return atomic_read(&pp_thread_score);
+	return pp_thread_score;
 }
 
 /*#######################

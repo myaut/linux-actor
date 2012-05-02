@@ -17,9 +17,18 @@
 #include <linux/proc_fs.h>
 #include <linux/timer.h>
 #include <linux/clocksource.h>
+#include <linux/semaphore.h>
+#include <linux/wait.h>
 
-#define CONFIG_ACTOR_TRACE
-#define CONFIG_ACTOR_DEBUG
+//#define CONFIG_ACTOR_TRACE
+//#define CONFIG_ACTOR_DEBUG
+
+/* Maximum number of asynchronious communications
+ * that are processed simultaneously*/
+#define CONFIG_ACTOR_MAX_QLEN	1024
+/* Number of free slots when sender selects
+ * slowpath for actor_communicate_async*/
+#define ACTOR_QLEN_THRESHOLD NR_CPUS
 
 /*Actor debug routine*/
 #ifdef CONFIG_ACTOR_TRACE
@@ -99,7 +108,15 @@ typedef int (*actor_dtor)(actor_t* self);
 #define 	ACTOR_SUCCESS		0
 #define 	ACTOR_INCOMPLETE	1
 
-#define     ACTOR_MAGIC         0xAC1900AC
+#define     ACTOR_MAGIC         0xAC10930D
+
+#ifdef CONFIG_ACTOR_DEBUG
+#define ACTOR_MAGIC_CHECK(ac)   \
+    BUG_ON(!ac || (ac)->a_magic != ACTOR_MAGIC)
+#else 
+#define ACTOR_MAGIC_CHECK(ac) 
+#endif
+
 
 /**
  * Actor callback function
@@ -107,17 +124,30 @@ typedef int (*actor_dtor)(actor_t* self);
 typedef int (*actor_callback)(actor_t* self, amsg_hdr_t* msg, int aw_flags);
 
 typedef enum {
-	AS_NOT_INITIALIZED,
-    AS_STOPPED,
-    AS_RUNNABLE,
-	AS_RUNNABLE_INCOMPLETE,
-	AS_EXECUTING
+	AS_NOT_INITIALIZED,         /*Actor is not yet initialized*/
+    AS_STOPPED,                 /*No works for this actor*/
+    AS_RUNNABLE,                /*There are new works on queues*/
+	AS_RUNNABLE_INCOMPLETE,     /*There are incompleted works on queue*/
+	AS_EXECUTING,               /*Actor is on node*/
+    AS_FROZEN                   /*Actor is frozen before destroying. 
+                                  Doesn't accept new messages. */
 } actor_state_t;
 
+/*Check for any of RUNNABLE flags*/
+#define ACTOR_IS_RUNNABLE(astate)                   \
+           ( astate == AS_RUNNABLE ||               \
+             astate == AS_RUNNABLE_INCOMPLETE ||    \
+             astate == AS_FROZEN )
+
 #define AW_NONE				0x0
+
 #define AW_BLOCKING 		0x1
-#define AW_COMMUNICATING	0x2
-#define AW_COMM_COMPLETE	0x4
+#define AW_ATOMIC			0x2
+#define AW_COMMUNICATING	0x4
+#define AW_ASYNCHRONOUS 	0x8
+
+#define AW_COMM_COMPLETE	0x100
+
 
 /*
  * Actor work is queue of messages which actor has to process.
@@ -135,7 +165,6 @@ typedef enum {
 	} }															\
 
 #define AWORK_HIST_ADD(aw, op) AWORK_HIST_ADD_2(aw, op, 0UL)
-
 #else
 #define AWORK_HIST_ADD2(aw, op, arg)
 #define AWORK_HIST_ADD(aw, op)
@@ -200,10 +229,19 @@ struct actor {
 	struct task_struct* a_proc;			/*Associated process*/
 	
     spinlock_t          a_msg_lock;      /*Protects message queue*/
-	
+
+#if 0
+    struct semaphore	a_queue_sem;
+#else
+    atomic_t			a_qlen;
+    long				a_max_qlen;
+    wait_queue_head_t	a_queue_wq;
+#endif
+
 	struct list_head    a_work_active;  /*Work queue which is currently processed*/
 	struct list_head    a_work_message;  /*Work queue to put messages*/
-	struct list_head	a_work_waiting;	/*Works waiting for finishing communication*/
+	
+	struct completion   a_destroy_wait; /*Wait until actor completes all it's works*/
 
 	unsigned long		a_jiffies;		/*Last actor execution mark*/
 
@@ -236,7 +274,7 @@ struct actor_head {
 	 	 	 	 	 	 	 	 	 New actors may only attach to this queue*/
 	struct list_head ah_queue_migr;  /*List of actors which was attached to this
 	 	 	 	 	 	 	 	 	 node during migration and doesn't migrate their
-	 	 	 	 	 	 	 	 	 private data*/
+	 	 	 	 	 	  	 	 private data*/
 
 	struct list_head ah_queue_stop;	 /*Actors that stopped execution because they are processed
 	 	 	 	 	 	 	 	 	   their messages*/
@@ -268,6 +306,7 @@ static actor_t* actor_create_simple(u32 flags, u32 prio, int nodeid, char* name,
 void actor_destroy(actor_t* ac);
 
 int actor_communicate(actor_t* ac, amsg_hdr_t* msg);
+int actor_communicate_async(actor_t* ac, amsg_hdr_t* msg);
 int actor_communicate_blocked(actor_t* ac, amsg_hdr_t* msg);
 
 amsg_hdr_t* amsg_create(u32 untyped_num, u32 typed_num, int nodeid);
@@ -281,3 +320,4 @@ int actor_trace(char* name, char* fmtstr, ...);
 #endif
 
 #endif
+

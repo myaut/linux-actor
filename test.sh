@@ -1,6 +1,11 @@
 #!/bin/bash
 
 MODDIR=/pool/leo4-devel/actor/mod2
+REPORTDIR=/tmp/report
+
+if [ ! -d $REPORTDIR ]; then
+	mkdir $REPORTDIR
+fi
 
 function gen_add_helper() 
 {
@@ -29,16 +34,62 @@ function add_module() {
     MODNAME=$1
     MODFILE=$MODNAME.ko
     MODPATH=$MODDIR/$MODFILE
-    
-    insmod $MODPATH
+
+    if insmod $MODPATH; then
+		echo "Added module $MODNAME"
+	else
+		exit 1
+	fi
     
     gen_add_helper $MODNAME $MODPATH
 }
-    
+
+function rm_module() {
+    MODNAME=$1
+    MODFILE=$MODNAME.ko
+    MODPATH=$MODDIR/$MODFILE
+
+    if rmmod $MODPATH; then
+		echo "Removed module $MODNAME"
+	else
+		exit 1
+	fi
+}
+
+function run_tests() {
+	TESTNAME=$1
+	TESTTIME=10
+	
+	echo "Testing $TESTNAME..."
+
+	./ctxsw.stp > $REPORTDIR/${TESTNAME}_ctxsw.out &
+	
+	opcontrol --reset 
+	opcontrol --start
+	
+	echo -n $TESTNAME > /proc/actor_bench
+	sleep $TESTTIME
+	
+	opcontrol --stop
+	
+	opreport -p $MODDIR -l > $REPORTDIR/${TESTNAME}_oprof.out
+}
+
+function enable_debugger() {
+	echo "Enabled debugger!"
+	
+	echo ttyS1,115200 > /sys/module/kgdboc/parameters/kgdboc
+}
+
+enable_debugger
+
 add_module actor
 add_module bench
 
-echo ttyS1,115200 > /sys/module/kgdboc/parameters/kgdboc
+read -p "Press [Enter] to start tests... "
 
-echo -n 'pp_thread' > /proc/actor_bench
+run_tests actor
+run_tests multi_actor
 
+rm_module bench
+rm_module actor
