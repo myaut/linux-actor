@@ -22,13 +22,17 @@
 
 //#define CONFIG_ACTOR_TRACE
 //#define CONFIG_ACTOR_DEBUG
+#define CONFIG_ACTOR_LOCK_TIMING
 
 /* Maximum number of asynchronious communications
  * that are processed simultaneously*/
 #define CONFIG_ACTOR_MAX_QLEN	1024
 /* Number of free slots when sender selects
  * slowpath for actor_communicate_async*/
-#define ACTOR_QLEN_THRESHOLD NR_CPUS
+#define ACTOR_QLEN_THRESHOLD 	(4 * num_online_cpus())
+/* Number of busy slots when actor desides to wakeup sleeping threads
+ */
+#define ACTOR_WAKEUP_THRESHOLD	ACTOR_QLEN_THRESHOLD
 
 /*Actor debug routine*/
 #ifdef CONFIG_ACTOR_TRACE
@@ -38,6 +42,20 @@
 #else
 #	define ADEBUG(name, format, ...)
 #	define A_NOINLINE	noinline
+#endif
+
+#ifdef CONFIG_ACTOR_LOCK_TIMING
+struct alock_timing {
+	unsigned long count;
+	unsigned long busy;
+};
+
+#define DEFINE_ALOCK_TIMING(name) \
+		struct alock_timing name
+
+#define DECLARE_ALOCK_TIMING(name) \
+		DEFINE_ALOCK_TIMING(name) = { 0UL , 0UL }
+
 #endif
 
 #define ANAMEMAXLEN     16
@@ -194,6 +212,9 @@ struct actor_work {
 };
 typedef struct actor_work actor_work_t;
 
+#define AWORK_MESSAGE(ac, cpu)	ac->a_work_message[cpu]
+#define AWORK_MESSAGE_THIS(ac)	AWORK_MESSAGE(ac, smp_processor_id())
+
 struct actor {
 #   ifdef CONFIG_ACTOR_DEBUG
     unsigned long a_magic;
@@ -227,20 +248,18 @@ struct actor {
     } a_exec;
 	
 	struct task_struct* a_proc;			/*Associated process*/
-	
-    spinlock_t          a_msg_lock;      /*Protects message queue*/
 
-#if 0
-    struct semaphore	a_queue_sem;
-#else
     atomic_t			a_qlen;
     long				a_max_qlen;
     wait_queue_head_t	a_queue_wq;
-#endif
 
 	struct list_head    a_work_active;  /*Work queue which is currently processed*/
-	struct list_head    a_work_message;  /*Work queue to put messages*/
-	
+
+	struct {
+		spinlock_t       lock;
+		struct list_head queue;
+	} a_work_message[NR_CPUS];			/*One queue per cpu*/
+
 	struct completion   a_destroy_wait; /*Wait until actor completes all it's works*/
 
 	unsigned long		a_jiffies;		/*Last actor execution mark*/

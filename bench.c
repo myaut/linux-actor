@@ -12,6 +12,7 @@
 #include <linux/string.h>
 #include <asm/uaccess.h>
 #include <linux/cpumask.h>
+#include <linux/percpu.h>
 
 struct benchmark;
 
@@ -54,6 +55,7 @@ int actor_test_callback(actor_t* self, amsg_hdr_t* msg, int aw_flags) {
 
 	abp->i++;
 
+// return abp->is_done;
 	return ACTOR_SUCCESS;
 }
 
@@ -200,13 +202,41 @@ long mutex_bench_results(struct benchmark* b) {
 }
 
 
+/********************
+ * PER_CPU
+ ********************/
+
+static DEFINE_PER_CPU(long, test_percpu);
+
+int percpu_bench(struct benchmark* b, void* data) {
+	percpu_add(test_percpu, 1);
+
+	return 0;
+}
+
+long percpu_bench_results(struct benchmark* b) {
+	int i = 0;
+	long res = 0;
+
+	for_each_online_node(i) {
+		res += per_cpu(test_percpu, i);
+	}
+
+	return res;
+}
+
+
 /*#######################
  *  Ping-Pong Benchmark
  *#######################*/
 
-#define NUM_CLIENTS 32
+static unsigned int num_clients = 32;
+module_param(num_clients, uint, S_IRWXU);
+#define NUM_CLIENTS num_clients
 
-#define NUM_DOMAINS 16
+static unsigned int num_domains = 8;
+module_param(num_domains, uint, S_IRWXU);
+#define NUM_DOMAINS num_domains
 
 /********************
  * ACTOR
@@ -216,7 +246,7 @@ static atomic_t pp_actor_score;
 
 int pp_actor_is_done = 1;
 
-static actor_t* pp_actors[NUM_DOMAINS];
+static actor_t** pp_actors;
 
 struct pp_actor_priv {
 	actor_t* next;
@@ -257,6 +287,8 @@ int pp_actor_init(void) {
 	int nodeid = smp_processor_id();
 	actor_t* prev = NULL;
 
+	pp_actors = kmalloc(sizeof(actor_t*) * num_domains, GFP_KERNEL);
+
 	//Last actor in chain
 	prev = actor_create(0, 0, nodeid, "pp_last", NULL, NULL, pp_actor_last_cb, NULL);
 	pp_actors[ai--] = prev;
@@ -284,6 +316,8 @@ int pp_actor_deinit(void) {
 
 	for(ai = 0; ai < NUM_DOMAINS; ++ai)
 		actor_destroy(pp_actors[ai]);
+
+	kfree(pp_actors);
 
 	return 0;
 }
@@ -322,7 +356,7 @@ static struct pp_thread_struct {
 
 	struct list_head queue;
 	struct mutex lock;
-} pp_threads[NUM_DOMAINS];
+} *pp_threads;
 
 void pp_thread_forward(struct list_head* l, struct pp_thread_struct* next) {
 	list_del(l);
@@ -402,6 +436,8 @@ int pp_thread_init(void) {
 
 	pp_thread_is_done = 0;
 
+	pp_threads = kmalloc(sizeof(struct pp_thread_struct) * num_domains, GFP_KERNEL);
+
 	for(; ti >= 0; --ti) {
 		mutex_init(&(pp_threads[ti].lock));
 		INIT_LIST_HEAD(&(pp_threads[ti].queue));
@@ -473,7 +509,7 @@ struct benchmark {
 static volatile bench_stage_t benchmark_stage = BENCH_NONE;
 static struct timer_list bench_timer;
 
-struct task_struct* bench_threads[NUM_CLIENTS] = {NULL};
+struct task_struct** bench_threads;
 
 struct proc_dir_entry* test_proc_entry;
 
@@ -500,6 +536,7 @@ struct benchmark benchmarks[] =
 	BENCHMARK(actor),
 	BENCHMARK(multi_actor),
 	BENCHMARK2(atomic),
+	BENCHMARK2(percpu),
 	BENCHMARK2(spinlock),
 	BENCHMARK2(mutex),
 	BENCHMARK(pp_actor),
@@ -526,14 +563,17 @@ void benchmark_timer_func(unsigned long data) {
 					finished->name, finished->bench_get_results(finished), BENCH_DURATION);
 
 	benchmark_stage = BENCH_DONE;
+	smp_mb();
 }
 
 int benchmark_thread(void* data) {
 	struct benchmark* benchmark = NULL;
+	bench_stage_t bs = BENCH_DONE;
 
-	while(benchmark_stage != BENCH_DONE) {
-		benchmark = benchmarks + benchmark_stage;
+	while((bs = benchmark_stage) != BENCH_DONE) {
+		benchmark = benchmarks + bs;
 		benchmark->bench_func(benchmark, data);
+		smp_mb();
 	}
 
 	return 0;
@@ -625,9 +665,10 @@ int benchmark_init(void) {
 		return PTR_ERR(test_actor);
 
 
+	bench_threads = kmalloc(sizeof(struct task_struct*) * num_clients, GFP_KERNEL);
+
 	init_timer(&bench_timer);
 	setup_timer(&bench_timer, benchmark_timer_func, 0);
-
 
 	test_proc_entry = create_proc_entry("actor_bench", 0600, NULL);
 	test_proc_entry->read_proc = test_proc_read;
@@ -644,6 +685,8 @@ void benchmark_exit(void) {
 	/* for_each_online_cpu(i) {
 		kthread_stop(bench_threads[i]);
 	} */
+
+	kfree(bench_threads);
 
 	del_timer(&bench_timer);
 

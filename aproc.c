@@ -3,17 +3,54 @@
 #include <linux/seq_file.h>
 
 static struct proc_dir_entry* aproc_root;
+static struct proc_dir_entry* aproc_alocktm;
+
+#ifdef CONFIG_ACTOR_LOCK_TIMING
+extern DEFINE_ALOCK_TIMING(alock_message);
+extern DEFINE_ALOCK_TIMING(alock_amutex);
+extern DEFINE_ALOCK_TIMING(alock_node);
+
+static int aproc_alocktm_show(struct seq_file* sf, void* v) {
+	seq_printf(sf, "Message queue (SPINLOCK): %ld %ld\n", alock_message.busy, alock_message.count);
+	seq_printf(sf, "Actor (MUTEX): %ld %ld\n", alock_amutex.busy, alock_amutex.count);
+	seq_printf(sf, "Node head (SPINLOCK): %ld %ld\n", alock_node.busy, alock_node.count);
+
+	return 0;
+}
+
+static int aproc_alocktm_open(struct inode *inode, struct file *file) {
+	return single_open(file, aproc_alocktm_show, PDE(inode)->data);
+}
+
+static const struct file_operations aproc_alocktm_fops = {
+	.open		= aproc_alocktm_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+#endif
 
 /*
  * Common actor-procfs routines
  * */
 void aproc_init(void) {
 	aproc_root = proc_mkdir("actor", NULL);
+
+#ifdef CONFIG_ACTOR_LOCK_TIMING
+	aproc_alocktm = proc_create_data("alock", S_IRUGO, aproc_root,
+										 &aproc_alocktm_fops, NULL);
+#endif
 }
 
 void aproc_exit(void) {
 	remove_proc_entry("actor", NULL);
+
+#ifdef CONFIG_ACTOR_LOCK_TIMING
+	remove_proc_entry("alocktm", aproc_root);
+#endif
 }
+
+
 
 /*
  * Routines for actor heads

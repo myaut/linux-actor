@@ -35,6 +35,35 @@ MODULE_LICENSE("GPL");
 /*Forward declaration*/
 int actor_kthread(void*);
 
+#ifdef CONFIG_ACTOR_LOCK_TIMING
+DECLARE_ALOCK_TIMING(alock_message);
+DECLARE_ALOCK_TIMING(alock_amutex);
+DECLARE_ALOCK_TIMING(alock_node);
+
+#define AMUTEX_LOCK(ac)	    if(!mutex_trylock(&ac->a_mutex)) {		\
+									++alock_amutex.busy;			\
+									mutex_lock(&ac->a_mutex);		\
+							}										\
+							++alock_amutex.count
+
+#define TIMED_SPINLOCK(sl, sltm)							\
+							if(!spin_trylock(&sl)) {		\
+									++sltm.busy;			\
+									spin_lock(&sl);			\
+							}								\
+							++sltm.count
+
+#define AMESSAGE_LOCK(am)	TIMED_SPINLOCK(am.lock, alock_message)
+#define ANODE_LOCK(ah)		TIMED_SPINLOCK(ah->ah_lock, alock_node)
+
+#else
+
+#define AMUTEX_LOCK(ac)		mutex_lock(&ac->a_mutex)
+#define AMESSAGE_LOCK(am)	spin_lock(&am.lock)
+#define ANODE_LOCK(ah)		spin_lock(&ah->ah_lock)
+
+#endif
+
 #ifdef CONFIG_ACTOR_TRACE
 
 #include <trace/events/actor.h>
@@ -231,6 +260,7 @@ actor_t* actor_create(u32 flags, u32 prio, int nodeid, char* name,
 		actor_ctor ctor, actor_dtor dtor, actor_callback f,
 		void* data) {
 	actor_t* ac = NULL;
+	int i;
 	
 	if(unlikely(!HWTOPO_NODE_CORRECT(nodeid))) 
 		return ERR_PTR(-EFAULT);
@@ -259,21 +289,21 @@ actor_t* actor_create(u32 flags, u32 prio, int nodeid, char* name,
     ac->a_name[ANAMEMAXLEN - 1] = 0;
 	
     mutex_init(&ac->a_mutex);
-    spin_lock_init(&ac->a_msg_lock);
     
     ac->a_private_temp = data;
     ac->a_private = NULL;
     ac->a_private_len = 0;
 
-#if 0
-    sema_init(&ac->a_queue_sem, CONFIG_ACTOR_MAX_QLEN);
-#else
+
     ac->a_max_qlen = CONFIG_ACTOR_MAX_QLEN;
     atomic_set(&ac->a_qlen, 0);
     init_waitqueue_head(&ac->a_queue_wq);
-#endif
 
-    INIT_LIST_HEAD(&(ac->a_work_message));
+    HWTOPO_FOR_EACH_NODE(i) {
+    	spin_lock_init(&AWORK_MESSAGE(ac, i).lock);
+    	INIT_LIST_HEAD(&AWORK_MESSAGE(ac, i).queue);
+    }
+
     INIT_LIST_HEAD(&(ac->a_work_active));
 
     init_completion(&(ac->a_destroy_wait));
@@ -335,7 +365,7 @@ void actor_destroy(actor_t* ac) {
     
 	aproc_free_actor(ac);
 
-    mutex_lock(&ac->a_mutex);
+    AMUTEX_LOCK(ac);
     
     prev_state = ac->a_state;
     ac->a_state = AS_FROZEN;
@@ -466,7 +496,7 @@ static void actor_try_dispatch(actor_t* ac, actor_state_t new_state) {
 		BUG_ON(!mutex_is_locked(&ac->a_mutex));
 #endif
 
-		spin_lock(&ah->ah_lock);
+		ANODE_LOCK(ah);
 		list_del(&ac->a_list);
 		list_add_tail(&ac->a_list, &ah->ah_queue_wait);
 		spin_unlock(&ah->ah_lock);
@@ -494,10 +524,10 @@ void actor_put_work(actor_t* ac, actor_work_t* aw) {
 	AWORK_HIST_ADD(aw, 'P');
 	
 	/*Now put actor work on message queue*/
-    spin_lock(&(ac->a_msg_lock));  
-    list_add_tail(&(aw->aw_list), &(ac->a_work_message));
+    AMESSAGE_LOCK(AWORK_MESSAGE_THIS(ac));
+    list_add_tail(&(aw->aw_list), &(AWORK_MESSAGE_THIS(ac).queue));
 	smp_mb();
-	spin_unlock(&(ac->a_msg_lock));
+	spin_unlock(&(AWORK_MESSAGE_THIS(ac).lock));
     
 	/* If owner is another actor_put_work, it will do all work for us
 	 * If owner is actor node process, it will check queue and make internal resched*/
@@ -553,11 +583,6 @@ int actor_communicate_async(actor_t* ac, amsg_hdr_t* msg) {
 	BUG_ON(get_current_work() != NULL);
 #endif
 
-#if 0
-	rc = down_interruptible(&ac->a_queue_sem);
-	if(rc != 0)
-		return rc;
-#else
 	if(unlikely(actor_free_slots(ac) < ACTOR_QLEN_THRESHOLD)) {
 		rc = wait_event_interruptible(ac->a_queue_wq,
 						actor_free_slots(ac) >= ACTOR_QLEN_THRESHOLD);
@@ -567,7 +592,6 @@ int actor_communicate_async(actor_t* ac, amsg_hdr_t* msg) {
 	}
 
 	atomic_inc(&ac->a_qlen);
-#endif
 
 	aw = actor_work_create(ac, msg, AW_ASYNCHRONOUS);
 
@@ -631,10 +655,14 @@ EXPORT_SYMBOL_GPL(actor_communicate_blocked);
  * @param ac actor
  */
 A_NOINLINE void actor_queue_join(actor_t* ac)  {
-    spin_lock(&ac->a_msg_lock);
-    list_splice_init(&ac->a_work_message, &ac->a_work_active);
-	smp_mb();	/*work_message reinitiated, say this to other nodes*/
-    spin_unlock(&ac->a_msg_lock);
+	int i = 0;
+
+	HWTOPO_FOR_EACH_NODE(i) {
+		AMESSAGE_LOCK(AWORK_MESSAGE(ac, i));
+		list_splice_tail_init(&(AWORK_MESSAGE(ac, i).queue), &ac->a_work_active);
+		smp_mb();	/*work_message reinitiated, say this to other nodes*/
+		spin_unlock(&(AWORK_MESSAGE(ac, i).lock));
+	}
 }
 
 /**
@@ -643,11 +671,16 @@ A_NOINLINE void actor_queue_join(actor_t* ac)  {
  * @param ac actor 
  */
 A_NOINLINE int actor_queue_isempty(actor_t* ac)  {
-	int isempty = 0;
+	int isempty = list_empty(&ac->a_work_active);
+	int i = 0;
 
-    spin_lock(&ac->a_msg_lock);
-    isempty = list_empty(&ac->a_work_message) & list_empty(&ac->a_work_active);
-    spin_unlock(&ac->a_msg_lock);
+	/*FIXME: use flags*/
+
+	HWTOPO_FOR_EACH_NODE(i) {
+		AMESSAGE_LOCK(AWORK_MESSAGE(ac, i));
+		isempty &= list_empty(&(AWORK_MESSAGE(ac, i).queue));
+		spin_unlock(&(AWORK_MESSAGE(ac, i).lock));
+	}
 
     return isempty;
 }
@@ -751,8 +784,8 @@ int actor_select_queue(actor_t* ac, struct actor_head* ah, int actor_complete) {
 #ifdef CONFIG_ACTOR_DEBUG
 	BUG_ON(!mutex_is_locked(&ac->a_mutex));
 #endif
-	
-	spin_lock(&ah->ah_lock);
+
+	ANODE_LOCK(ah);
 	actor_set_state(ac, next_state);
 	list_add_tail(&ac->a_list, next_queue);
 	spin_unlock(&ah->ah_lock);
@@ -771,6 +804,8 @@ int actor_execute(actor_t* ac, struct actor_head* ah) {
     struct list_head *l = NULL, *ln = NULL;
     actor_work_t* aw = NULL;
     int actor_complete = 1, work_complete = 0;
+
+    LIST_HEAD(a_work_incomplete);
 
     actor_queue_join(ac);
 
@@ -804,18 +839,14 @@ int actor_execute(actor_t* ac, struct actor_head* ah) {
 				/*Put unfinished works in front of message queue*/
 				AWORK_HIST_ADD(aw, 'I');
 				
-			    spin_lock(&(ac->a_msg_lock));
-			    list_add(l, &(ac->a_work_message));
-			    smp_mb();
-				spin_unlock(&(ac->a_msg_lock));
+			    list_add(l, &a_work_incomplete);
 				
 				actor_put_work(ac, aw);
 			}
 			else {
 				if(aw->aw_flags & AW_ASYNCHRONOUS) {
-					/* If async queue was full, wakeup all threads concurrently*/
-					if(atomic_dec_return(&ac->a_qlen) >=
-							(ac->a_max_qlen - ACTOR_QLEN_THRESHOLD))
+					/* If async queue was full, wakeup threads concurrently*/
+					if(atomic_dec_return(&ac->a_qlen) <= ACTOR_WAKEUP_THRESHOLD)
 						wake_up_all(&ac->a_queue_wq);
 				}
 
@@ -824,9 +855,11 @@ int actor_execute(actor_t* ac, struct actor_head* ah) {
 		}
 	}
 	
+	list_splice(&a_work_incomplete, &ac->a_work_active);
+
     ADEBUG("actor_execute_done", "Executed actor %s-%llu\n", ac->a_name, ac->a_uid);
 
-	mutex_lock(&ac->a_mutex);
+	AMUTEX_LOCK(ac);
 
 out:
 	/*Finished execution*/
@@ -900,7 +933,7 @@ void actor_node_init_actors(struct actor_head* ah) {
 
 /*Attach node queue to exec*/
 #define ATTACH_NODE_QUEUE(ah, queue) 			\
-		spin_lock(&ah->ah_lock);				\
+		ANODE_LOCK(ah);							\
 		list_splice_init(&ah->queue, 			\
 					&ah->ah_queue_exec);		\
 		spin_unlock(&ah->ah_lock);
@@ -927,7 +960,7 @@ int __actor_node_process(struct actor_head* ah) {
 		 * */
 		actor_complete = 1;
         
-		mutex_lock(&(a->a_mutex));
+		AMUTEX_LOCK(a);
 
 		list_del(l);
 
@@ -947,7 +980,7 @@ int __actor_node_process(struct actor_head* ah) {
 	}
 	
 	/*Check queues*/
-	spin_lock(&ah->ah_lock);
+	ANODE_LOCK(ah);
 	node_processed = list_empty(&ah->ah_queue_exec) && list_empty(&ah->ah_queue_wait);
 	spin_unlock(&ah->ah_lock);
 
@@ -958,22 +991,19 @@ int __actor_node_process(struct actor_head* ah) {
 int actor_node_process(struct actor_head* ah) {
 	int node_processed = 0;
 
-    ADEBUG("actor_node_process", "Actor node process @%d\n", ah->ah_nodeid);
+	while(!node_processed) {
+		ADEBUG("actor_node_process", "Actor node process @%d\n", ah->ah_nodeid);
 
-    if(test_and_clear_bit(ACTOR_NODE_INIT, &ah->ah_flags))
-    	actor_node_init_actors(ah);
+		if(test_and_clear_bit(ACTOR_NODE_INIT, &ah->ah_flags))
+			actor_node_init_actors(ah);
 
-    /*Attach all waiters*/
-    ATTACH_NODE_QUEUE(ah, ah_queue_wait);
+		/*Attach all waiters*/
+		ATTACH_NODE_QUEUE(ah, ah_queue_wait);
 
-    node_processed = __actor_node_process(ah);
+		node_processed = __actor_node_process(ah);
 
-    if(!node_processed) {
-    	set_bit(ACTOR_NODE_DISPATCHED, &ah->ah_flags);
-
-    	/*Allow other processes to run but we are not done yet*/
-    	yield();
-    }
+		might_sleep();
+	}
 
     return node_processed;
 }
