@@ -37,6 +37,7 @@ int actor_kthread(void*);
 
 #ifdef CONFIG_ACTOR_LOCK_TIMING
 DECLARE_ALOCK_TIMING(alock_message);
+DECLARE_ALOCK_TIMING(alock_work);
 DECLARE_ALOCK_TIMING(alock_amutex);
 DECLARE_ALOCK_TIMING(alock_node);
 
@@ -44,6 +45,13 @@ DECLARE_ALOCK_TIMING(alock_node);
 									++alock_amutex.busy;			\
 									mutex_lock(&ac->a_mutex);		\
 							}										\
+							++alock_amutex.count
+
+#define AMUTEX_SPIN(ac)	    if(!mutex_trylock(&ac->a_mutex)) {			\
+									++alock_amutex.busy;				\
+									while(!mutex_trylock(&ac->a_mutex))	\
+											cpu_relax();				\
+							}											\
 							++alock_amutex.count
 
 #define TIMED_SPINLOCK(sl, sltm)							\
@@ -55,12 +63,16 @@ DECLARE_ALOCK_TIMING(alock_node);
 
 #define AMESSAGE_LOCK(am)	TIMED_SPINLOCK(am.lock, alock_message)
 #define ANODE_LOCK(ah)		TIMED_SPINLOCK(ah->ah_lock, alock_node)
+#define AWORK_LOCK(aw)		TIMED_SPINLOCK(aw->aw_lock, alock_work)
 
 #else
 
 #define AMUTEX_LOCK(ac)		mutex_lock(&ac->a_mutex)
 #define AMESSAGE_LOCK(am)	spin_lock(&am.lock)
 #define ANODE_LOCK(ah)		spin_lock(&ah->ah_lock)
+#define AWORK_LOCK(aw)		spin_lock(&aw->aw_lock)
+#define AMUTEX_SPIN(ac)		while(!mutex_trylock(&ac->a_mutex))	\
+								cpu_relax();
 
 #endif
 
@@ -91,11 +103,9 @@ static void actor_node_init(int nodeid);
 static void actor_node_timer_func(unsigned long data);
 
 static actor_work_t* get_current_work(void) {
-#ifdef CONFIG_ACTOR_DEBUG    
     /* Curwork should be NULL if kactor-thread not on CPU */
-    BUG_ON( percpu_read_stable(actor_curwork) != NULL &&
-            current != actor_list[smp_processor_id()].ah_kthread);
-#endif
+    ACTOR_CHECK( percpu_read_stable(actor_curwork) != NULL &&
+            	 current != actor_list[smp_processor_id()].ah_kthread);
     
     return percpu_read_stable(actor_curwork);
 }
@@ -164,20 +174,21 @@ module_exit(amod_exit);
  * 
  * @param untyped_num number of untyped items
  * @param typed_num number of typed items
- * @param nodeid where message would be sent
+ * @param ae desired pipeline. If NULL - uses default actor's pipeline
+ * @param nodeid nodeid, where message would be sent (needed for better localiness)
  * 
  * For non-local messages allocation will be made using DMA zone (to reduce cache coherency)
  * and to node nodeid. Also, for non-local messages untyped items may be copied
  * 
  * TODO: untyped items locality
  */
-amsg_hdr_t* amsg_create(u32 untyped_num, u32 typed_num, int nodeid) {
+amsg_hdr_t* amsg_create(u32 untyped_num, u32 typed_num, actor_exec_t* ae, int nodeid) {
     u32 sz = sizeof(amsg_hdr_t) + untyped_num * sizeof(amsg_word_t) + 
                 typed_num * sizeof(amsg_typed_t); 
                 
     /* Allocate in uncached zone (DMA) to reduce number
      of cache misses when sender and receiver are located on
-     different nodes*/
+     different nodes.*/
     amsg_hdr_t* msg = kmalloc(sz, GFP_ATOMIC | (HWTOPO_NODE_ISLOCAL(nodeid))? 0 : GFP_DMA);
     
     if(!msg)
@@ -185,9 +196,10 @@ amsg_hdr_t* amsg_create(u32 untyped_num, u32 typed_num, int nodeid) {
     
     atomic_set(&msg->am_count, 0);
 
-    msg->len = sz;
-    msg->untyped = (amsg_word_t*) (char*) msg + sizeof(amsg_hdr_t);
-    msg->typed = (amsg_typed_t*) ((char*) msg->untyped + untyped_num * sizeof(amsg_word_t));
+    msg->am_exec = ae;
+
+    msg->am_untyped_num = untyped_num;
+    msg->am_typed_num = typed_num;
     
     return msg;
 }
@@ -215,7 +227,9 @@ void actor_attach(actor_t* ac) {
 
 	set_bit(ACTOR_NODE_INIT, &ah->ah_flags);
 	
+	mutex_lock(&ac->a_mutex);
 	actor_try_dispatch(ac, AS_NOT_INITIALIZED);
+	mutex_unlock(&ac->a_mutex);
 }
 
 /**
@@ -257,12 +271,12 @@ void actor_detach(actor_t* ac) {
  * Prototype:  f(actor_t* self, amsg_hdr_t* msg)
  */
 actor_t* actor_create(u32 flags, u32 prio, int nodeid, char* name,
-		actor_ctor ctor, actor_dtor dtor, actor_callback f,
+		actor_ctor ctor, actor_dtor dtor, actor_exec_t* ae,
 		void* data) {
 	actor_t* ac = NULL;
 	int i;
 	
-	if(unlikely(!HWTOPO_NODE_CORRECT(nodeid))) 
+	if(unlikely(!HWTOPO_NODE_CORRECT(nodeid) || !ae ))
 		return ERR_PTR(-EFAULT);
 	
 	ac = kmem_cache_alloc(actor_cache, GFP_KERNEL);
@@ -276,7 +290,8 @@ actor_t* actor_create(u32 flags, u32 prio, int nodeid, char* name,
     
 	ac->a_flags = flags;
 	ac->a_prio = prio;
-	ac->a_exec.a_function = f;
+
+	ac->a_exec = ae;
 
 	ac->a_ctor = ctor;
 	ac->a_dtor = dtor;
@@ -294,6 +309,7 @@ actor_t* actor_create(u32 flags, u32 prio, int nodeid, char* name,
     ac->a_private = NULL;
     ac->a_private_len = 0;
 
+    ac->a_jiffies = 0;
 
     ac->a_max_qlen = CONFIG_ACTOR_MAX_QLEN;
     atomic_set(&ac->a_qlen, 0);
@@ -398,7 +414,7 @@ EXPORT_SYMBOL_GPL(actor_destroy);
  * @return pointer to allocated actor work or NULL in case of error \ 
  * (incorrect state of actor, allocation failure)
  * */
-static actor_work_t* actor_work_create(actor_t* ac, amsg_hdr_t* msg, int flags) {
+static actor_work_t* actor_work_create(actor_t* ac, amsg_hdr_t* msg, u64 flags) {
 	actor_work_t* aw = NULL;
     
 	ACTOR_MAGIC_CHECK(ac);
@@ -431,9 +447,8 @@ static actor_work_t* actor_work_create(actor_t* ac, amsg_hdr_t* msg, int flags) 
 
 	atomic_set(&aw->aw_count, 1);
 
-	INIT_LIST_HEAD(&(aw->aw_list));
-	
-	init_completion(&(aw->aw_wait));
+	spin_lock_init(&aw->aw_lock);
+	INIT_LIST_HEAD(&aw->aw_list);
 
 #ifdef CONFIG_ACTOR_DEBUG
 	atomic_set(&aw->aw_hist_index, 0);
@@ -454,8 +469,9 @@ void actor_work_hold(actor_work_t* aw) {
 
 /**
  * Decrease work's ref count and message ref count
- * 
  * If needed, frees work and message
+ * 
+ * @return 1 if work was freed, 0 if not
  */
 int actor_work_rele(actor_work_t* aw) {
     int rc;
@@ -487,17 +503,15 @@ static void actor_try_dispatch(actor_t* ac, actor_state_t new_state) {
 			 	 ac->a_name, ac->a_uid, ac->a_nodeid, ac, aproc_actor_state_str(new_state));
 
 	ACTOR_MAGIC_CHECK(ac);
+	ACTOR_CHECK(!mutex_is_locked(&ac->a_mutex));
+
 	actor_set_state(ac, new_state);
 	
 	/*Attach to waiters queue if needed*/
 	if(ACTOR_IS_RUNNABLE(new_state)) {
-
-#ifdef CONFIG_ACTOR_DEBUG
-		BUG_ON(!mutex_is_locked(&ac->a_mutex));
-#endif
+		list_del(&ac->a_list);
 
 		ANODE_LOCK(ah);
-		list_del(&ac->a_list);
 		list_add_tail(&ac->a_list, &ah->ah_queue_wait);
 		spin_unlock(&ah->ah_lock);
 	}
@@ -516,10 +530,8 @@ void actor_put_work(actor_t* ac, actor_work_t* aw) {
 	ADEBUG("actor_put_work", "Put work %s[%d] -> %s-%llu@%d [%p] work: %p\n",
 		    current->comm, current->pid, ac->a_name, ac->a_uid, ac->a_nodeid, ac, aw );
 
-#ifdef CONFIG_ACTOR_DEBUG
 	ACTOR_MAGIC_CHECK(ac);
-	BUG_ON(aw->aw_actor != ac);
-#endif
+	ACTOR_CHECK(aw->aw_actor != ac);
 	
 	AWORK_HIST_ADD(aw, 'P');
 	
@@ -527,20 +539,19 @@ void actor_put_work(actor_t* ac, actor_work_t* aw) {
     AMESSAGE_LOCK(AWORK_MESSAGE_THIS(ac));
     list_add_tail(&(aw->aw_list), &(AWORK_MESSAGE_THIS(ac).queue));
 	smp_mb();
-	spin_unlock(&(AWORK_MESSAGE_THIS(ac).lock));
-    
-	/* If owner is another actor_put_work, it will do all work for us
-	 * If owner is actor node process, it will check queue and make internal resched*/
-	if(!mutex_trylock(&ac->a_mutex))
-		return;
-    
-	/* If actor was stopped - need redispatch him
-	 * or it will be redispatched when actor_execute detects
-	 * that queue is not empty*/
-	if(ac->a_state == AS_STOPPED)
-		actor_try_dispatch(ac, AS_RUNNABLE);
 
-	mutex_unlock(&ac->a_mutex);
+	spin_unlock(&(AWORK_MESSAGE_THIS(ac).lock));
+
+	/* If actor was stopped - need redispatch him
+	 * or it will be redispatched when actor_execute detects that queue is not empty*/
+	if(ac->a_state == AS_STOPPED) {
+		AMUTEX_SPIN(ac);
+
+		if(ac->a_state == AS_STOPPED)
+			actor_try_dispatch(ac, AS_RUNNABLE);
+
+		mutex_unlock(&ac->a_mutex);
+	}
 }
 
 static long actor_free_slots(actor_t* ac) {
@@ -579,9 +590,7 @@ int actor_communicate_async(actor_t* ac, amsg_hdr_t* msg) {
 	actor_work_t* aw = NULL;
 	int rc = 0;
 
-#ifdef CONFIG_ACTOR_DEBUG
-	BUG_ON(get_current_work() != NULL);
-#endif
+	ACTOR_CHECK(get_current_work() != NULL);
 
 	if(unlikely(actor_free_slots(ac) < ACTOR_QLEN_THRESHOLD)) {
 		rc = wait_event_interruptible(ac->a_queue_wq,
@@ -620,24 +629,57 @@ int actor_communicate_blocked(actor_t* ac, amsg_hdr_t* msg) {
 	if(likely(aw)) {
 		if(!curwork) {
 			/*THREAD -> ACTOR, threads may sleep*/
+			init_completion(&aw->aw_wait);
+
 			AWORK_HIST_ADD(aw, 'T');
                         
 			actor_work_hold(aw);
-			
 			actor_put_work(ac, aw);
-			wait_for_completion(&(aw->aw_wait));
 			
+			while(wait_for_completion_timeout(&(aw->aw_wait), HZ) == 0) {
+				pr_warn("Execution of work %p took more than a second", aw);
+				BUG();
+			}
+
 			actor_work_rele(aw);
 		}
 		else {
-			/*ACTOR -> ACTOR*/         
+			/*ACTOR -> ACTOR*/
+			AWORK_LOCK(curwork);
+			if(curwork->aw_flags & AW_COMMUNICATING) {
+#ifdef CONFIG_ACTOR_DEBUG
+				pr_warn("New communications cannot be started, actor %s-%llu",
+								curwork->aw_actor->a_name,
+								curwork->aw_actor->a_uid);
+#endif
+				spin_unlock(&curwork->aw_lock);
+				return -EINVAL;
+			}
+
+			if(curwork->aw_comm_count == AMAXCOMM) {
+#ifdef CONFIG_ACTOR_DEBUG
+				pr_warn("Too many communications are made by actor %s-%llu",
+								curwork->aw_actor->a_name,
+								curwork->aw_actor->a_uid);
+#endif
+				spin_unlock(&curwork->aw_lock);
+				return -EINVAL;
+			}
+
+			curwork->aw_flags |= AW_COMMUNICATING;
+
 			AWORK_HIST_ADD(aw, 'A');
             AWORK_HIST_ADD(curwork, '>');
 
 			actor_work_hold(curwork);
 			aw->aw_wait_work = curwork;
-			
-			curwork->aw_flags |= AW_COMMUNICATING;
+
+#ifdef CONFIG_ACTOR_DEBUG
+			curwork->aw_last_comm = aw;
+#endif
+			aw->aw_ww_comm = curwork->aw_comm_count++;
+
+			spin_unlock(&curwork->aw_lock);
 
 			actor_put_work(ac, aw);
 		}
@@ -671,14 +713,16 @@ A_NOINLINE void actor_queue_join(actor_t* ac)  {
  * @param ac actor 
  */
 A_NOINLINE int actor_queue_isempty(actor_t* ac)  {
-	int isempty = list_empty(&ac->a_work_active);
+	int isempty = 1;
 	int i = 0;
 
-	/*FIXME: use flags*/
+	if(!list_empty(&ac->a_work_active))
+		return 0;
 
 	HWTOPO_FOR_EACH_NODE(i) {
 		AMESSAGE_LOCK(AWORK_MESSAGE(ac, i));
-		isempty &= list_empty(&(AWORK_MESSAGE(ac, i).queue));
+		if(isempty)
+			isempty &= list_empty(&(AWORK_MESSAGE(ac, i).queue));
 		spin_unlock(&(AWORK_MESSAGE(ac, i).lock));
 	}
 
@@ -687,23 +731,34 @@ A_NOINLINE int actor_queue_isempty(actor_t* ac)  {
 
 /**
  * Execute work for actor
- *
- * TODO: pipelined actors
  * */
 int actor_execute_work(actor_t* ac, actor_work_t* aw) {
 	int rc;
+	actor_exec_t* ae = aw->aw_msg->am_exec;
+	actor_callback callback;
 	
 	ACTOR_MAGIC_CHECK(ac);
 	AWORK_HIST_ADD(aw, '1');
 	
+	/*Fail back to default pipeline*/
+	if(unlikely(!ae))
+		ae = ac->a_exec;
+
+	callback = ae->ae_pipeline[aw->aw_pipe_count];
+
+	if(unlikely(!callback)) {
+		pr_warn("Reached end of actor pipeline for %s-%llu", ac->a_name, ac->a_uid);
+		BUG();
+	}
+
 	ADEBUG("actor_execute", "Processing work %p for actor %s-%llu exec: %p\n", aw, ac->a_name, ac->a_uid,
-	        		ac->a_exec.a_function);
+	        		ac->a_exec);
     
     preempt_disable();
     percpu_write(actor_curwork, aw);
-    
-	rc = (ac->a_exec.a_function(ac, aw->aw_msg, aw->aw_flags) == ACTOR_SUCCESS);
-    
+
+	rc = callback(ac, aw);
+
     percpu_write(actor_curwork, NULL);
 	preempt_enable();
     
@@ -720,12 +775,13 @@ int actor_execute_work(actor_t* ac, actor_work_t* aw) {
 void actor_finish_work(actor_work_t* aw) {
 	actor_t* awaken = NULL;
 	actor_work_t* wait_work = NULL;
+	int redispatch = 0;
 
 	AWORK_HIST_ADD(aw, 'F');
 	
 	if(likely(aw->aw_flags & AW_BLOCKING)) {
 		if(!aw->aw_wait_work) {
-			complete(&(aw->aw_wait));
+			complete(&aw->aw_wait);
 		}
 		else {
 			/*Release waiter*/
@@ -733,19 +789,34 @@ void actor_finish_work(actor_work_t* aw) {
 			awaken = wait_work->aw_actor;
 			
 			ACTOR_MAGIC_CHECK(awaken);
-
-			ADEBUG("actor_finish_work", "Releasing waiter %s-%llu %p\n", awaken->a_name, awaken->a_uid, awaken);
 			
+			AWORK_LOCK(wait_work);
+
 			wait_work->aw_flags |= AW_COMM_COMPLETE;
+			wait_work->aw_comm_flags |= 1 << aw->aw_ww_comm;
+
+			if(--wait_work->aw_comm_count == 0)
+				wait_work->aw_flags &= ~AW_COMMUNICATING;
+
+			if(!(wait_work->aw_flags & (AW_EXECUTING | AW_REDISPATCHED | AW_FINISHED))) {
+				redispatch = 1;
+				wait_work->aw_flags |= AW_REDISPATCHED;
+			}
+
+			spin_unlock(&wait_work->aw_lock);
+
+			ADEBUG("actor_finish_work", "Releasing waiter %s-%llu %p\n", awaken->a_name,
+						awaken->a_uid, awaken);
 
 #ifdef CONFIG_ACTOR_DEBUG
-			/* Work shouldn't be freed this time because it has to be redispatched*/
-			BUG_ON(actor_work_rele(wait_work));
-#else
-			actor_work_rele(wait_work);
+			if(wait_work->aw_last_comm == aw)
+				wait_work->aw_last_comm = NULL;
 #endif
-			
-			actor_put_work(awaken, wait_work);
+
+			actor_work_rele(wait_work);
+
+			if(redispatch)
+				actor_put_work(awaken, wait_work);
 		}
 	}
 
@@ -763,6 +834,16 @@ int actor_select_queue(actor_t* ac, struct actor_head* ah, int actor_complete) {
     actor_state_t next_state = AS_STOPPED;
     struct list_head* next_queue = NULL;
 
+    /* When actor_queue_isempty is concurrently called with actor_put_work,
+     * it may return false even if put work already added message to queue
+     * (because there are one queue per cpu)
+     *
+     * So we say actor_put_work that it should try to redispatch actor even if actor_select_queue
+     * already called
+     * */
+    actor_set_state(ac, AS_STOPPED);
+    smp_mb();
+
 	if(actor_complete == 0) {
 		/*Not all works are completed successfully or timeslice exhausted*/
 		next_state = AS_RUNNABLE_INCOMPLETE;
@@ -774,16 +855,14 @@ int actor_select_queue(actor_t* ac, struct actor_head* ah, int actor_complete) {
 			next_queue = &ah->ah_queue_stop;
 		}
 		else {
-			/*Receiving new messages while executed*/
+			/*Received new messages while executing*/
 			next_state = AS_RUNNABLE;
 			actor_complete = 0;
 			next_queue = &ah->ah_queue_wait;
 		}
 	}
 
-#ifdef CONFIG_ACTOR_DEBUG
-	BUG_ON(!mutex_is_locked(&ac->a_mutex));
-#endif
+	ACTOR_CHECK(!mutex_is_locked(&ac->a_mutex));
 
 	ANODE_LOCK(ah);
 	actor_set_state(ac, next_state);
@@ -803,7 +882,7 @@ int actor_select_queue(actor_t* ac, struct actor_head* ah, int actor_complete) {
 int actor_execute(actor_t* ac, struct actor_head* ah) {
     struct list_head *l = NULL, *ln = NULL;
     actor_work_t* aw = NULL;
-    int actor_complete = 1, work_complete = 0;
+    int actor_complete = 1, work_status = 0, finish_work = 0;
 
     LIST_HEAD(a_work_incomplete);
 
@@ -825,23 +904,28 @@ int actor_execute(actor_t* ac, struct actor_head* ah) {
 
 		ACTOR_MAGIC_CHECK(aw->aw_actor);
 
-		/* Unlink curwork */
+		AWORK_LOCK(aw);
+		aw->aw_flags |= AW_EXECUTING;
+		aw->aw_flags &= ~AW_REDISPATCHED;
+		spin_unlock(&aw->aw_lock);
+
 		list_del(l);
 		
-        /* FIXME: Must use communicating counter */
-		aw->aw_flags &= ~AW_COMMUNICATING;
-    
-		work_complete = actor_execute_work(ac, aw);
-		actor_complete &= work_complete;
-		
+		finish_work = 0;
+		work_status = actor_execute_work(ac, aw);
+
+		AWORK_LOCK(aw);
+		if(work_status != ACTOR_INCOMPLETE_STAGE)
+			++aw->aw_pipe_count;
+
+		/*Not started communication or all comms are complete*/
 		if(!(aw->aw_flags & AW_COMMUNICATING)) {
-			if(!work_complete) {
-				/*Put unfinished works in front of message queue*/
+			if(work_status != ACTOR_SUCCESS) {
 				AWORK_HIST_ADD(aw, 'I');
-				
-			    list_add(l, &a_work_incomplete);
-				
-				actor_put_work(ac, aw);
+				list_add(l, &a_work_incomplete);
+				actor_complete = 0;
+
+				aw->aw_flags |= AW_REDISPATCHED;
 			}
 			else {
 				if(aw->aw_flags & AW_ASYNCHRONOUS) {
@@ -850,9 +934,16 @@ int actor_execute(actor_t* ac, struct actor_head* ah) {
 						wake_up_all(&ac->a_queue_wq);
 				}
 
-				actor_finish_work(aw);
+				finish_work = 1;
+				aw->aw_flags |= AW_FINISHED;
 			}
 		}
+
+		aw->aw_flags &= ~AW_EXECUTING;
+		spin_unlock(&aw->aw_lock);
+
+		if(finish_work)
+			actor_finish_work(aw);
 	}
 	
 	list_splice(&a_work_incomplete, &ac->a_work_active);
@@ -961,8 +1052,7 @@ int __actor_node_process(struct actor_head* ah) {
 		actor_complete = 1;
         
 		AMUTEX_LOCK(a);
-
-		list_del(l);
+		list_del_init(l);
 
 		/*If actor is runnable (e.g. communication has started)
 		 or it was not processed successfully during last timeslice*/

@@ -32,6 +32,17 @@ typedef struct actor_bench_private {
 
 static actor_t* test_actor;
 
+int actor_test_callback(actor_t* self, actor_work_t* aw) {
+	actor_bench_priv_t* abp = (actor_bench_priv_t*) self->a_private;
+
+	abp->i++;
+
+// return abp->is_done;
+	return ACTOR_SUCCESS;
+}
+
+static DECLARE_ACTOR_EXEC(actor_test_exec, actor_test_callback);
+
 int actor_test_ctor(actor_t* self, void* data) {
 	actor_bench_priv_t* abp = (actor_bench_priv_t*)
 			actor_private_allocate(self, sizeof(actor_bench_priv_t));
@@ -50,19 +61,10 @@ int actor_test_dtor(actor_t* self) {
 	return 0;
 }
 
-int actor_test_callback(actor_t* self, amsg_hdr_t* msg, int aw_flags) {
-	actor_bench_priv_t* abp = (actor_bench_priv_t*) self->a_private;
-
-	abp->i++;
-
-// return abp->is_done;
-	return ACTOR_SUCCESS;
-}
-
 int actor_init(void) {
 	test_actor = actor_create(0, 0, smp_processor_id(),
 								"test", actor_test_ctor, actor_test_dtor,
-								actor_test_callback, NULL);
+								&actor_test_exec, NULL);
 
 	return 0;
 }
@@ -74,7 +76,7 @@ int actor_deinit(void) {
 }
 
 int actor_bench(struct benchmark* b, void* data) {
-	amsg_hdr_t* msg = amsg_create(0, 0, test_actor->a_nodeid);
+	amsg_hdr_t* msg = amsg_create(0, 0, NULL, test_actor->a_nodeid);
 
 	/*Message is freed on actor-side*/
 	return actor_communicate_async(test_actor, msg);
@@ -103,7 +105,7 @@ int multi_actor_init(void) {
 				actor_create(0, 0, i, "multi",
 							actor_test_ctor,
 							actor_test_dtor,
-							actor_test_callback,
+							&actor_test_exec,
 							NULL);
 	}
 
@@ -124,7 +126,7 @@ int multi_actor_bench(struct benchmark* b, void* data) {
 	int nodeid = smp_processor_id();
 	actor_t* ac = test_multi_actor[nodeid];
 
-	amsg_hdr_t* msg = amsg_create(0, 0, nodeid);
+	amsg_hdr_t* msg = amsg_create(0, 0, NULL, nodeid);
 
 	/*Message is freed on actor-side*/
 	return actor_communicate_async(ac, msg);
@@ -261,19 +263,21 @@ int pp_actor_med_ctor(actor_t* self, void* data) {
 	return 0;
 }
 
-int pp_actor_med_cb(actor_t* ac, amsg_hdr_t* msg, int aw_flags) {
+int pp_actor_med_cb(actor_t* ac, actor_work_t* aw) {
 	/*Send message to */
 	struct pp_actor_priv* p = (struct pp_actor_priv*) ac->a_private;
-
-	/*Communication for msg is finished*/
-	if(aw_flags & AW_COMM_COMPLETE)
-		return ACTOR_SUCCESS;
 	
 	/*Forward message to next actor*/
-	actor_communicate_blocked(p->next, msg);
+	actor_communicate_blocked(p->next, aw->aw_msg);
 
+	return ACTOR_INCOMPLETE;
+}
+
+int pp_actor_med_cb2(actor_t* ac, actor_work_t* aw) {
 	return ACTOR_SUCCESS;
 }
+
+static DECLARE_ACTOR_EXEC(pp_actor_med_exec, pp_actor_med_cb, pp_actor_med_cb2);
 
 int pp_actor_last_cb(actor_t* ac, amsg_hdr_t* msg, int aw_flags) {
 	/*Last actor in chain simply returns success*/
@@ -281,6 +285,8 @@ int pp_actor_last_cb(actor_t* ac, amsg_hdr_t* msg, int aw_flags) {
 
 	return ACTOR_SUCCESS;
 }
+
+static DECLARE_ACTOR_EXEC(pp_actor_last_exec, pp_actor_last_cb);
 
 int pp_actor_init(void) {
 	int ai = NUM_DOMAINS - 1;
@@ -290,7 +296,7 @@ int pp_actor_init(void) {
 	pp_actors = kmalloc(sizeof(actor_t*) * num_domains, GFP_KERNEL);
 
 	//Last actor in chain
-	prev = actor_create(0, 0, nodeid, "pp_last", NULL, NULL, pp_actor_last_cb, NULL);
+	prev = actor_create(0, 0, nodeid, "pp_last", NULL, NULL, &pp_actor_last_exec, NULL);
 	pp_actors[ai--] = prev;
 
 	pp_actor_is_done = 0;
@@ -304,7 +310,7 @@ int pp_actor_init(void) {
 		prev = actor_create(0, 0, nodeid, "pp_med",
 							pp_actor_med_ctor,
 							NULL,
-							pp_actor_med_cb, (void*) prev);
+							&pp_actor_med_exec, (void*) prev);
 		pp_actors[ai] = prev;
 	}
 
@@ -324,7 +330,7 @@ int pp_actor_deinit(void) {
 
 int pp_actor_bench(struct benchmark* b, void* data) {
 	/*Send message to first actor and wait*/
-	amsg_hdr_t* msg = amsg_create(0, 0, smp_processor_id());
+	amsg_hdr_t* msg = amsg_create(0, 0, NULL, smp_processor_id());
 
 	actor_communicate_blocked(pp_actors[0], msg);
 

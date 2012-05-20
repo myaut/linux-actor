@@ -9,21 +9,23 @@ static struct proc_dir_entry* aproc_alocktm;
 extern DEFINE_ALOCK_TIMING(alock_message);
 extern DEFINE_ALOCK_TIMING(alock_amutex);
 extern DEFINE_ALOCK_TIMING(alock_node);
+extern DEFINE_ALOCK_TIMING(alock_work);
 
-static int aproc_alocktm_show(struct seq_file* sf, void* v) {
+static int aproc_locktm_show(struct seq_file* sf, void* v) {
 	seq_printf(sf, "Message queue (SPINLOCK): %ld %ld\n", alock_message.busy, alock_message.count);
 	seq_printf(sf, "Actor (MUTEX): %ld %ld\n", alock_amutex.busy, alock_amutex.count);
 	seq_printf(sf, "Node head (SPINLOCK): %ld %ld\n", alock_node.busy, alock_node.count);
+	seq_printf(sf, "Work (SPINLOCK): %ld %ld\n", alock_work.busy, alock_work.count);
 
 	return 0;
 }
 
-static int aproc_alocktm_open(struct inode *inode, struct file *file) {
-	return single_open(file, aproc_alocktm_show, PDE(inode)->data);
+static int aproc_locktm_open(struct inode *inode, struct file *file) {
+	return single_open(file, aproc_locktm_show, PDE(inode)->data);
 }
 
-static const struct file_operations aproc_alocktm_fops = {
-	.open		= aproc_alocktm_open,
+static const struct file_operations aproc_locktm_fops = {
+	.open		= aproc_locktm_open,
 	.read		= seq_read,
 	.llseek		= seq_lseek,
 	.release	= single_release,
@@ -37,17 +39,17 @@ void aproc_init(void) {
 	aproc_root = proc_mkdir("actor", NULL);
 
 #ifdef CONFIG_ACTOR_LOCK_TIMING
-	aproc_alocktm = proc_create_data("alock", S_IRUGO, aproc_root,
-										 &aproc_alocktm_fops, NULL);
+	aproc_alocktm = proc_create_data("lock_timing", S_IRUGO, aproc_root,
+										 &aproc_locktm_fops, NULL);
 #endif
 }
 
 void aproc_exit(void) {
-	remove_proc_entry("actor", NULL);
-
 #ifdef CONFIG_ACTOR_LOCK_TIMING
-	remove_proc_entry("alocktm", aproc_root);
+	remove_proc_entry("lock_timing", aproc_root);
 #endif
+
+	remove_proc_entry("actor", NULL);
 }
 
 
@@ -132,8 +134,7 @@ static int aproc_actor_show(struct seq_file* sf, void* v) {
 	seq_printf(sf, "Priority: %d\n", ac->a_prio);
 	seq_printf(sf, "Last executed: %ld\n", ac->a_jiffies);
 
-	/*FIXME: pipelined actors*/
-	seq_printf(sf, "Callback: %p\n", ac->a_exec.a_function);
+	seq_printf(sf, "Default exec: %p\n", ac->a_exec);
 
 	return 0;
 }

@@ -37,7 +37,7 @@
 /*Actor debug routine*/
 #ifdef CONFIG_ACTOR_TRACE
 #	define ADEBUG(name, format, ...) __actor_trace(name, format, __VA_ARGS__); \
-									 ; /* printk(KERN_INFO "@%d " name ": " format, smp_processor_id(), __VA_ARGS__); */
+									 ;  printk(KERN_INFO "@%d " name ": " format, smp_processor_id(), __VA_ARGS__);
 #	define A_NOINLINE	noinline
 #else
 #	define ADEBUG(name, format, ...)
@@ -60,9 +60,34 @@ struct alock_timing {
 
 #define ANAMEMAXLEN     16
 #define AMAXPIPELINE    8
+#define AMAXCOMM		32
 
 #define APROC_HEAD_NAMELEN	 	18
-#define APROC_ACTOR_NAMELEN			21 + ANAMEMAXLEN + 1
+#define APROC_ACTOR_NAMELEN		21 + ANAMEMAXLEN + 1
+
+struct actor;
+typedef struct actor actor_t;
+
+struct actor_work;
+typedef struct actor_work actor_work_t;
+
+/* Return values of actor callback*/
+#define 	ACTOR_SUCCESS		   0
+#define 	ACTOR_INCOMPLETE	   1
+#define		ACTOR_INCOMPLETE_STAGE 2
+
+/**
+ * Actor callback function */
+typedef int (*actor_callback)(struct actor* self, actor_work_t* work);
+
+typedef struct actor_exec {
+	actor_callback	ae_pipeline[AMAXPIPELINE];
+} actor_exec_t;
+
+/*FIXME: Doesn't work for eight callbacks*/
+#define DECLARE_ACTOR_EXEC(name, ...)  actor_exec_t name = {	\
+				.ae_pipeline = {__VA_ARGS__, 0}					\
+			};
 
 /*
  * Actor message format.
@@ -70,21 +95,17 @@ struct alock_timing {
  * work in shared memory so we have simpler serialization protocol.
  * 
  * +--------+
- * | HDR:   |
- * | len    | 
- * | untyped|--+
- * | typed  |--|--+
- * +--------+<-+  |
- * |  ...   |     |
- * |        |     |
- * +--------+<----+
+ * | Header |
+ * +--------+
+ * | untyped|
  * |  ...   |
+ * |        |
+ * +--------+
+ * | typed  |
  * |        |
  * |        |
  * +--------+
  * 
- * number of untyped items = ((char*) typed - (char*) untyped) / sizeof(amsg_word_t)
- * number of typed items = (((char*) msgptr + hdrlen) - (char*) untyped) / sizeof(amsg_typed_t)
  */
 
 typedef unsigned long amsg_word_t;
@@ -95,13 +116,14 @@ typedef struct {
 
 /*Header for actor request*/ 
 struct amsg_hdr {
-    u32     len;
-    
-    atomic_t		am_count;		/*Reference count*/
+    atomic_t		  am_count;		/*Reference count*/
 
-    amsg_word_t      result;
-    amsg_word_t*     untyped;
-    amsg_typed_t*    typed;
+    actor_exec_t* 	  am_exec;
+
+    u16				  am_untyped_num;
+    u16				  am_typed_num;
+    amsg_word_t 	  am_result;
+    amsg_word_t       am_untyped[0];
 };
 typedef struct amsg_hdr amsg_hdr_t;
 
@@ -113,33 +135,23 @@ typedef struct amsg_hdr amsg_hdr_t;
  * 
  */
 
-struct actor;
-typedef struct actor actor_t;
-
 
 typedef int (*actor_ctor)(actor_t* self, void* data);
 typedef int (*actor_dtor)(actor_t* self);
 
-/* Return values of actor callback
- *
- * NOTE: any non-zero value is treated as incomplete*/
-#define 	ACTOR_SUCCESS		0
-#define 	ACTOR_INCOMPLETE	1
+
 
 #define     ACTOR_MAGIC         0xAC10930D
 
 #ifdef CONFIG_ACTOR_DEBUG
 #define ACTOR_MAGIC_CHECK(ac)   \
     BUG_ON(!ac || (ac)->a_magic != ACTOR_MAGIC)
+#define ACTOR_CHECK(cond) 	BUG_ON(cond)
 #else 
-#define ACTOR_MAGIC_CHECK(ac) 
+#define ACTOR_MAGIC_CHECK(ac)
+#define ACTOR_CHECK(cond)
 #endif
 
-
-/**
- * Actor callback function
- * must return 0 if message was processed or 1 if message should be blocked */
-typedef int (*actor_callback)(actor_t* self, amsg_hdr_t* msg, int aw_flags);
 
 typedef enum {
 	AS_NOT_INITIALIZED,         /*Actor is not yet initialized*/
@@ -164,7 +176,12 @@ typedef enum {
 #define AW_COMMUNICATING	0x4
 #define AW_ASYNCHRONOUS 	0x8
 
-#define AW_COMM_COMPLETE	0x100
+#define AW_COMM_START		0x10
+#define AW_COMM_COMPLETE	0x20
+
+#define AW_EXECUTING		0x100
+#define AW_REDISPATCHED		0x200
+#define AW_FINISHED			0x400
 
 
 /*
@@ -180,6 +197,7 @@ typedef enum {
 		aw->aw_hist[hi].h_op = op;								\
 		aw->aw_hist[hi].h_ret_ip = _RET_IP_;					\
 		aw->aw_hist[hi].h_comm =  current->comm;				\
+		aw->aw_hist[hi].h_flags = aw->aw_flags;					\
 	} }															\
 
 #define AWORK_HIST_ADD(aw, op) AWORK_HIST_ADD_2(aw, op, 0UL)
@@ -192,25 +210,40 @@ struct actor_work {
     actor_t*    aw_actor;
     amsg_hdr_t* aw_msg;
     
+    spinlock_t	aw_lock;				/*Protects aw_flags*/
     struct list_head aw_list;
 
-    struct completion aw_wait;	/*Waiter completion for external threads*/
+    struct completion aw_wait;			/*Waiter completion for external threads*/
 
     atomic_t aw_count;					/*Count of referencing waiters*/
-    struct actor_work* aw_wait_work;	/*Waiter blocked on actor_int_communicate*/
+    struct actor_work* aw_wait_work;	/*Blocked work*/
+    u8 		aw_ww_comm;					/*ID of comm in blocked work*/
 
-    int aw_flags;
+    union {
+    	struct {
+    		/*FIXME: Endianess!*/
+    		u16 aw_misc_flags;
+
+    		u8 aw_comm_count;			/*Number of incomplete inter-actor communications*/
+			u8 aw_pipe_count;			/*Number of pipeline callbacks processed*/
+
+			u32 aw_comm_flags;
+    	};
+    	u64 aw_flags;
+    };
 
 #ifdef CONFIG_ACTOR_DEBUG
+    actor_work_t* aw_last_comm;
+
 	struct {
 		char h_op;				 /*Operation (HOLD/RELE)*/
 		unsigned long h_ret_ip;  /*_RET_IP_ value*/
-		char* h_comm;	 		 /*Current task*/
+		char* h_comm;	 		 /*Current task's name*/
+		u64   h_flags;			 /*aw->aw_flags*/
 	} aw_hist[AWORK_HIST_LEN];
 	atomic_t aw_hist_index;
 #endif
 };
-typedef struct actor_work actor_work_t;
 
 #define AWORK_MESSAGE(ac, cpu)	ac->a_work_message[cpu]
 #define AWORK_MESSAGE_THIS(ac)	AWORK_MESSAGE(ac, smp_processor_id())
@@ -238,14 +271,7 @@ struct actor {
 	actor_ctor a_ctor;
 	actor_dtor a_dtor;
 
-    union {
-        struct {
-            actor_callback	pipeline[AMAXPIPELINE];
-            u32             len;     
-        } a_pipeline;
-        
-        actor_callback a_function; /*Actor callback*/
-    } a_exec;
+	actor_exec_t* a_exec;
 	
 	struct task_struct* a_proc;			/*Associated process*/
 
@@ -314,13 +340,12 @@ struct actor_head {
 };
 
 actor_t* actor_create(u32 flags, u32 prio, int nodeid, char* name,
-			actor_ctor ctor, actor_dtor dtor, actor_callback f, void* data);
+			actor_ctor ctor, actor_dtor dtor, actor_exec_t* ae, void* data);
 
 static actor_t* actor_create_simple(u32 flags, u32 prio, int nodeid, char* name,
-			actor_callback f) {
-	return actor_create(flags, prio, nodeid, name, NULL, NULL, f, NULL);
+		actor_exec_t* ae) {
+	return actor_create(flags, prio, nodeid, name, NULL, NULL, ae, NULL);
 }
-
 
 void actor_destroy(actor_t* ac);
 
@@ -328,7 +353,7 @@ int actor_communicate(actor_t* ac, amsg_hdr_t* msg);
 int actor_communicate_async(actor_t* ac, amsg_hdr_t* msg);
 int actor_communicate_blocked(actor_t* ac, amsg_hdr_t* msg);
 
-amsg_hdr_t* amsg_create(u32 untyped_num, u32 typed_num, int nodeid);
+amsg_hdr_t* amsg_create(u32 untyped_num, u32 typed_num, actor_exec_t* ae, int nodeid);
 void amsg_free(amsg_hdr_t* msg);
 
 void* actor_private_allocate(actor_t* ac, unsigned long len);
